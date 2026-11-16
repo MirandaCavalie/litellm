@@ -285,7 +285,7 @@ async def test_shutdown_flushes_native_callbacks_after_the_logging_drain_and_bef
 
     spawn_logging_task(asyncio.get_running_loop(), native_row(), task_name="native row")
 
-    await litellm.proxy.proxy_server._flush_spend_around_logging_drain_on_shutdown(
+    await litellm.proxy.proxy_server._flush_spend_around_logging_drain_on_shutdown(  # pyright: ignore[reportPrivateUsage]  # the shutdown sequence under test
         flush_spend=flush_spend, flush_native=flush_native
     )
 
@@ -320,7 +320,7 @@ async def test_shutdown_flushes_each_native_callback_in_the_callback_lists_once(
     monkeypatch.setattr(litellm, "_async_success_callback", [native])
     monkeypatch.setattr(litellm, "_async_failure_callback", [native])
 
-    await litellm.proxy.proxy_server._flush_native_callbacks_on_shutdown()
+    await litellm.proxy.proxy_server.flush_native_callbacks_on_shutdown()
 
     assert handle.flushes == 1
 

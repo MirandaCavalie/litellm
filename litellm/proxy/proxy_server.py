@@ -1428,7 +1428,7 @@ async def _flush_spend_on_shutdown() -> None:
     await _flush_spend_logs_queue_on_shutdown()
 
 
-async def _flush_native_callbacks_on_shutdown() -> None:
+async def flush_native_callbacks_on_shutdown() -> None:
     from litellm.integrations.custom_logger_v2.rust import flush_native_loggers
 
     await flush_native_loggers(litellm.logging_callback_manager.get_all_callbacks())
@@ -1437,7 +1437,7 @@ async def _flush_native_callbacks_on_shutdown() -> None:
 async def _flush_spend_around_logging_drain_on_shutdown(
     flush_spend: Callable[[], Awaitable[None]] = _flush_spend_on_shutdown,
     *,
-    flush_native: Callable[[], Awaitable[None]] = _flush_native_callbacks_on_shutdown,
+    flush_native: Callable[[], Awaitable[None]] = flush_native_callbacks_on_shutdown,
     worker: LoggingWorker = GLOBAL_LOGGING_WORKER,
     clock: Callable[[], float] = time.monotonic,
     drain_tasks: Callable[[float], Awaitable[None]] = drain_logging_tasks,

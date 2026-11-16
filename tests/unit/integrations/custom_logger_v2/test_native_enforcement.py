@@ -2,7 +2,7 @@ import asyncio
 import json
 import threading
 from collections.abc import Callable, Iterator
-from typing import Final
+from typing import Final, cast
 from unittest.mock import patch
 
 import pytest
@@ -70,7 +70,7 @@ class _UndeclaredReader(CustomLoggerV2):
     @on(Hook.attempt_ended, reads={Field.model}, awaited=True)
     async def attempt_ended(self, view: object, ctx: CallContext[object]) -> None:
         try:
-            _ = getattr(view, Field.messages.value)
+            self.refused.append(repr(cast(object, getattr(view, Field.messages.value))))
         except ContractViolation as refusal:
             self.refused.append(str(refusal))
         self.done.set()
@@ -106,6 +106,7 @@ async def test_a_native_logger_delivers_its_row_with_only_its_declared_reads(
             await asyncio.sleep(0.01)
 
     (put,) = bucket.puts()
+    assert isinstance(response, litellm.ModelResponse)
     assert json.loads(put.body)["id"] == response.id
     failed.assert_not_called()
     assert enforced.failures == {}

@@ -14,13 +14,18 @@ from litellm.integrations.custom_logger import CustomLogger
 from litellm.integrations.custom_logger_v2 import CallContext, CustomLoggerV2, Field, Hook, on
 from litellm.integrations.custom_logger_v2 import derivations
 from litellm.integrations.custom_logger_v2.field_sources import HookArgs
-from litellm.litellm_core_utils.core_helpers import budget_reservation_from_metadata, get_litellm_metadata_from_kwargs
+from litellm.litellm_core_utils.core_helpers import (
+    budget_reservation_from_metadata,
+    get_litellm_metadata_from_kwargs,  # pyright: ignore[reportUnknownVariableType]  # the writer's untyped metadata read
+)
 from litellm.litellm_core_utils.internal_call_metadata import BACKGROUND_RESPONSE_COST_REQUEST_ID_SUFFIX
 from litellm.litellm_core_utils.batch_utils import BATCH_COST_REQUEST_ID_SUFFIX
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.db.db_spend_update_writer import DBSpendUpdateWriter
 from litellm.proxy.hooks.proxy_track_cost_callback import ProxyDBLogger
-from litellm.proxy.spend_tracking.spend_tracking_utils import get_logging_payload
+from litellm.proxy.spend_tracking.spend_tracking_utils import (
+    get_logging_payload,  # pyright: ignore[reportUnknownVariableType]  # the writer's row builder takes an untyped dict
+)
 from litellm.proxy.utils import BilledFailedAttempt
 from litellm.types.integrations.custom_logger_v2 import BudgetReservation, Cost, SpendLogId
 from litellm.types.passthrough_endpoints.pass_through_endpoints import (
@@ -29,7 +34,7 @@ from litellm.types.passthrough_endpoints.pass_through_endpoints import (
 )
 from litellm.types.utils import Usage
 
-_RESERVATION: Final = {
+_RESERVATION: Final[Mapping[str, object]] = {
     "reserved_cost": 0.75,
     "entries": [{"counter_key": "spend:key:k", "entity_type": "key", "entity_id": "k", "reserved_cost": 0.75}],
     "finalized": False,
@@ -38,7 +43,7 @@ _RESERVATION: Final = {
 
 class _WriterInputs(CustomLogger):
     def __init__(self) -> None:
-        super().__init__()
+        super().__init__()  # pyright: ignore[reportUnknownMemberType]  # CustomLogger takes untyped kwargs
         self.seen: list[tuple[Mapping[str, object], object]] = []  # mutable-ok: what the spend writer is handed
 
     async def async_log_success_event(
@@ -81,7 +86,8 @@ async def _logged(
         model="gpt-4o", messages=[{"role": "user", "content": "hi"}], mock_response="ok", **call
     )
     if call.get("stream") is True:
-        _ = [chunk async for chunk in response]  # pyright: ignore[reportGeneralTypeIssues]  # a streamed acompletion
+        assert isinstance(response, litellm.CustomStreamWrapper)
+        _ = [chunk async for chunk in response]  # pyright: ignore[reportUnknownVariableType]  # the stream yields untyped chunks
     assert await asyncio.to_thread(reader.done.wait, 30)
     for _ in range(300):
         if writer.seen:
@@ -156,7 +162,7 @@ async def test_the_logged_reservation_is_the_one_the_writer_settles(monkeypatch:
     (kwargs, _), (_, _, reservation) = await _logged(
         monkeypatch, metadata={"user_api_key_budget_reservation": copy.deepcopy(_RESERVATION)}
     )
-    settled: Final = budget_reservation_from_metadata(get_litellm_metadata_from_kwargs(dict(kwargs)))
+    settled: Final = budget_reservation_from_metadata(get_litellm_metadata_from_kwargs(dict(kwargs)))  # pyright: ignore[reportUnknownArgumentType]  # the writer's untyped metadata read
 
     assert settled is not None
     assert reservation == derivations.budget_reservation(HookArgs(auth=SimpleNamespace(budget_reservation=settled)))
@@ -166,7 +172,7 @@ async def test_the_logged_reservation_is_the_one_the_writer_settles(monkeypatch:
 async def test_a_request_without_a_reservation_reads_none_like_the_writer(monkeypatch: pytest.MonkeyPatch) -> None:
     (kwargs, _), (_, cost, reservation) = await _logged(monkeypatch)
 
-    assert budget_reservation_from_metadata(get_litellm_metadata_from_kwargs(dict(kwargs))) is None
+    assert budget_reservation_from_metadata(get_litellm_metadata_from_kwargs(dict(kwargs))) is None  # pyright: ignore[reportUnknownArgumentType]  # the writer's untyped metadata read
     assert reservation is None
     assert isinstance(cost, Cost) and cost.response_cost_failure_debug_info_present is True
 
@@ -220,8 +226,8 @@ def _failed_request(call_id: str, payload: Mapping[str, object] | None) -> dict[
 
 async def _written_rows(request: dict[str, object], error: Exception) -> list[Mapping[str, object]]:
     writer: Final = _RecordingSpendWriter()
-    with patch("litellm.proxy.proxy_server.general_settings", {}):
-        await ProxyDBLogger(spend_writer=lambda: cast(DBSpendUpdateWriter, writer)).async_post_call_failure_hook(
+    with patch("litellm.proxy.proxy_server.general_settings", dict[str, object]()):
+        await ProxyDBLogger(spend_writer=lambda: cast(DBSpendUpdateWriter, writer)).async_post_call_failure_hook(  # pyright: ignore[reportUnknownMemberType]  # the hook takes the untyped request dict
             request_data=request,
             original_exception=error,
             user_api_key_dict=UserAPIKeyAuth(api_key="hashed-key", user_id="u", team_id="t"),
@@ -284,7 +290,7 @@ async def test_a_failure_without_billed_attempts_has_none_and_keeps_the_finalize
 
 
 async def test_the_failure_reservation_is_the_auth_reservation_the_failure_writer_releases() -> None:
-    auth: Final = UserAPIKeyAuth(api_key="hashed-key", budget_reservation=copy.deepcopy(_RESERVATION))
+    auth: Final = UserAPIKeyAuth(api_key="hashed-key", budget_reservation=dict(copy.deepcopy(_RESERVATION)))
 
     reservation: Final = derivations.DERIVED_POST_CALL_FAILURE_FIELDS[Field.budget_reservation].read(
         HookArgs(auth=auth, request={})
