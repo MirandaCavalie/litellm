@@ -30,9 +30,11 @@ pub use health::health_check;
 pub use observe::{Call, Observer, Outcome, QueryEvent, observe};
 pub use pools::Pools;
 pub use spend::{
-    DailySpend, DailyTable, EntitySpend, SpendLog, SpendLogRow, TeamMemberSpend,
-    add_end_user_spend, add_key_spend, add_team_member_spend, add_team_spend, add_user_spend,
-    begin, insert_spend_logs, lock_team, upsert_daily_end_user_spend, upsert_daily_spend,
-    upsert_daily_team_spend, upsert_daily_user_spend,
+    DailySpend, DailyTable, EntitySpend, SPEND_LOG_COLUMNS, SPEND_LOG_JSON_COLUMNS, SpendLog,
+    SpendLogDelivery, SpendLogLedgerEntry, SpendLogRow, TeamMemberSpend, add_end_user_spend,
+    add_key_spend, add_team_member_spend, add_team_spend, add_user_spend, begin,
+    insert_spend_log_ledger, insert_spend_log_rows, insert_spend_logs, lock_team, spend_log_record,
+    spend_log_timestamp, upsert_daily_end_user_spend, upsert_daily_spend, upsert_daily_team_spend,
+    upsert_daily_user_spend, write_spend_log_ledger,
 };
 pub use statements::Statements;

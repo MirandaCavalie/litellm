@@ -8,6 +8,10 @@ pub enum Error {
     InvalidTimestamp(#[from] chrono::ParseError),
     #[error("invalid pool duration")]
     InvalidDuration(#[from] std::time::TryFromFloatSecsError),
+    #[error("spend log row rejected: {0}")]
+    RejectedSpendLogRow(String),
+    #[error("transaction timed out")]
+    TransactionTimedOut,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr)]
@@ -32,6 +36,7 @@ impl Error {
             Self::Query(sqlx::Error::Database(error)) => {
                 sqlstate_kind(error.code().as_deref(), error.message())
             }
+            Self::RejectedSpendLogRow(_) => ErrorKind::DataRejected,
             _ => ErrorKind::Other,
         }
     }
@@ -46,6 +51,13 @@ impl Error {
                 | ErrorKind::LockTimeout
                 | ErrorKind::StalePlan
         )
+    }
+
+    pub fn sqlstate(&self) -> Option<String> {
+        match self {
+            Self::Query(sqlx::Error::Database(error)) => error.code().map(|code| code.into_owned()),
+            _ => None,
+        }
     }
 
     pub fn needs_fresh_connections(&self) -> bool {
