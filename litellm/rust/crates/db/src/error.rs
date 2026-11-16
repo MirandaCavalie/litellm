@@ -12,6 +12,8 @@ pub enum Error {
     RejectedSpendLogRow(String),
     #[error("transaction timed out")]
     TransactionTimedOut,
+    #[error("invalid spend log delivery: {0}")]
+    InvalidSpendLogDelivery(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr)]

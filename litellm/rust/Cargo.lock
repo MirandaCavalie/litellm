@@ -5097,6 +5097,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "litellm-spend-log-writer"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "litellm-db",
+ "litellm-python-compat",
+ "litellm-secret-value",
+ "rstest",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "litellm-starlette"
 version = "0.1.0"
 dependencies = [
