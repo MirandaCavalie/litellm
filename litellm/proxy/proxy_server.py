@@ -926,17 +926,10 @@ from litellm.redis.stores.spend_counters import (
     SpendCounterStore,
     end_user_counter,
     is_unavailable,
-    key_counter,
-    key_window_counter,
     model_access_group_counter,
     org_counter,
     project_counter,
     tag_counter,
-    team_counter,
-    team_member_counter,
-    team_window_counter,
-    user_counter,
-    user_window_counter,
 )
 from litellm.router import router_arguments
 from litellm.router_config import build_router_config
@@ -1026,7 +1019,6 @@ from litellm.proxy.spend_tracking.budget_reservation import (
 from litellm.proxy.spend_tracking.committed_spend import (
     committed_spend_key,
     committed_spend_keys,
-    has_committed_twin,
     is_committed_spend_key,
     seed_committed_spend,
 )
@@ -4357,7 +4349,7 @@ async def _prepare_project_spend_increment(
 
 async def _prepare_unreserved_spend_counter_increment(
     counter_key: str,
-    source_cache_key: str | list[str],
+    source_cache_key: str | Sequence[str],
     increment: float,
     reserved_counter_keys: set[str],
 ) -> PendingSpendIncrement | None:
@@ -4373,7 +4365,7 @@ async def _prepare_unreserved_spend_counter_increment(
 
 async def _prepare_spend_counter_increment(
     counter_key: str,
-    source_cache_key: str | list[str],
+    source_cache_key: str | Sequence[str],
     increment: float,
 ) -> PendingSpendIncrement:
     """
@@ -4480,7 +4472,7 @@ async def _prepare_window_spend_counter_increment(
 
 async def ensure_spend_counter_initialized(
     counter_key: str,
-    source_cache_key: str | list[str],
+    source_cache_key: str | Sequence[str],
 ) -> None:
     is_warm: Final = await _is_spend_counter_cache_warm(counter_key=counter_key)
     if is_warm is False:
@@ -4502,7 +4494,7 @@ _ensure_spend_counter_initialized: Final = ensure_spend_counter_initialized
 
 
 async def _get_source_cache_base_spend(
-    source_cache_key: str | list[str],
+    source_cache_key: str | Sequence[str],
 ) -> float:
     source_cache_keys: Final = [source_cache_key] if isinstance(source_cache_key, str) else source_cache_key
     for cache_key in source_cache_keys:

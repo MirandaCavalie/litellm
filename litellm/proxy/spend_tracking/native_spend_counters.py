@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
-from typing import TYPE_CHECKING, Annotated, Final, Literal
+from typing import TYPE_CHECKING, Annotated, Final, Literal, TypeAlias
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
@@ -16,7 +16,7 @@ from litellm.rust_bridge._native import (
 if TYPE_CHECKING:
     from litellm.proxy.spend_tracking.budget_reservation import BudgetCounter
 
-WindowedEntity = Literal["key", "team", "user"]
+WindowedEntity: TypeAlias = Literal["key", "team", "user"]
 
 
 class CounterTask(BaseModel):
@@ -27,8 +27,8 @@ class CounterTask(BaseModel):
     source_cache_keys: tuple[str, ...]
 
     @property
-    def source_cache_key(self) -> str | list[str]:
-        return self.source_cache_keys[0] if len(self.source_cache_keys) == 1 else list(self.source_cache_keys)
+    def source_cache_key(self) -> str | tuple[str, ...]:
+        return self.source_cache_keys[0] if len(self.source_cache_keys) == 1 else self.source_cache_keys
 
 
 class CachedWindowsTask(BaseModel):
@@ -57,7 +57,7 @@ class CommittedTask(BaseModel):
     counter_keys: tuple[str, ...]
 
 
-SpendCounterTask = Annotated[
+SpendCounterTask: TypeAlias = Annotated[
     CounterTask | CachedWindowsTask | CustomerWindowTask | CommittedTask, Field(discriminator="task")
 ]
 
@@ -98,8 +98,8 @@ def _text(value: object) -> str | None:
     return value if isinstance(value, str) else None
 
 
-def _names(values: Iterable[object] | None) -> list[str | None] | None:
-    return None if values is None else [_text(value) for value in values]
+def _names(values: Iterable[object] | None) -> tuple[str | None, ...] | None:
+    return None if values is None else tuple(_text(value) for value in values)
 
 
 def _charge(
