@@ -265,6 +265,66 @@ async def test_shutdown_commits_spend_a_logging_task_queued_while_the_first_comm
     assert committed == ["failure row spend"]
 
 
+@pytest.mark.asyncio
+async def test_shutdown_flushes_native_callbacks_after_the_logging_drain_and_before_the_last_spend_flush() -> None:
+    from litellm.responses.streaming_iterator import spawn_logging_task
+
+    native_queue: Final[list[str]] = []
+    journal: Final[list[str]] = []
+
+    async def flush_spend() -> None:
+        journal.append("spend")
+
+    async def flush_native() -> None:
+        journal.append(f"native {','.join(native_queue)}")
+        native_queue.clear()
+
+    async def native_row() -> None:
+        await asyncio.sleep(0.01)
+        native_queue.append("row")
+
+    spawn_logging_task(asyncio.get_running_loop(), native_row(), task_name="native row")
+
+    await litellm.proxy.proxy_server._flush_spend_around_logging_drain_on_shutdown(
+        flush_spend=flush_spend, flush_native=flush_native
+    )
+
+    assert journal == ["spend", "native row", "spend"]
+
+
+@pytest.mark.asyncio
+async def test_shutdown_flushes_each_native_callback_in_the_callback_lists_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from litellm.integrations.custom_logger_v2.rust import RustLogger
+
+    class _Handle:
+        def __init__(self) -> None:
+            self.flushes = 0
+
+        def manifest(self) -> str:
+            return "{}"
+
+        def request_state(self) -> object:
+            return None
+
+        async def handle(self, *_: object) -> object:
+            return None
+
+        async def flush(self) -> None:
+            self.flushes += 1
+
+    handle: Final = _Handle()
+    native: Final = RustLogger(handle)
+    monkeypatch.setattr(litellm, "callbacks", [native, "langfuse"])
+    monkeypatch.setattr(litellm, "_async_success_callback", [native])
+    monkeypatch.setattr(litellm, "_async_failure_callback", [native])
+
+    await litellm.proxy.proxy_server._flush_native_callbacks_on_shutdown()
+
+    assert handle.flushes == 1
+
+
 token = MASTER_KEY
 
 
