@@ -3849,6 +3849,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "litellm-callbacks-spend-log"
+version = "0.1.0"
+dependencies = [
+ "fancy-regex 0.19.2",
+ "litellm-python-compat",
+ "litellm-tracing",
+ "num-traits",
+ "regex",
+ "rstest",
+ "sha2 0.10.9",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "litellm-circuit-breaker"
 version = "0.1.0"
 dependencies = [
