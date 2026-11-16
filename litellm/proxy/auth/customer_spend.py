@@ -4,6 +4,7 @@ from typing import Final
 
 from pydantic import ValidationError
 
+from litellm.proxy.spend_tracking.native_spend_counters import customer_settlement
 from litellm.redis.stores.spend_counters import SpendCounterStore
 from litellm.types.proxy.auth.customer_hierarchy import CustomerHierarchyAuth, CustomerScopeAuth
 
@@ -11,17 +12,6 @@ from litellm.types.proxy.auth.customer_hierarchy import CustomerHierarchyAuth, C
 def customer_spend_counter(scope: CustomerScopeAuth) -> str:
     period: Final = scope.budget_reset_at.isoformat() if scope.budget_reset_at is not None else "lifetime"
     return f"spend:{scope.key}:{scope.entity_id}:{period}"
-
-
-async def _current_scope(
-    scope: CustomerScopeAuth, current: float | None, store: SpendCounterStore
-) -> CustomerScopeAuth:
-    spend: Final = (
-        await store.seed(customer_spend_counter(scope), scope.spend, increment_if_lost=False)
-        if current is None
-        else current
-    )
-    return scope.model_copy(update={"spend": max(scope.spend, spend)})
 
 
 async def current_customer_spend(
@@ -46,8 +36,10 @@ async def settle_customer_spend(metadata: Mapping[str, object], cost: float, sto
         hierarchy: Final = CustomerHierarchyAuth.model_validate(snapshot)
     except ValidationError:
         return
-    readings: Final = await asyncio.gather(*(store.read(customer_spend_counter(scope)) for scope in hierarchy.scopes))
+    counters: Final = tuple((customer_spend_counter(scope), scope.spend) for scope in hierarchy.scopes)
+    readings: Final = await asyncio.gather(*(store.read(counter_key) for counter_key, _ in counters))
+    settlement: Final = customer_settlement(counters, tuple(reading[0] for reading in readings), cost)
     _ = await asyncio.gather(
-        *(_current_scope(scope, reading[0], store) for scope, reading in zip(hierarchy.scopes, readings, strict=True))
+        *(store.seed(counter_key, spend, increment_if_lost=False) for counter_key, spend in settlement.seeds)
     )
-    _ = await store.increment_many(tuple((customer_spend_counter(scope), cost) for scope in hierarchy.scopes))
+    _ = await store.increment_many(settlement.increments)
