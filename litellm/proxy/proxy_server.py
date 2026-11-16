@@ -648,8 +648,6 @@ from litellm.proxy.common_utils.user_api_key_cache import (
     budget_windows_absent_cache_key,
     end_user_cache_key,
     get_management_object_ttl,
-    model_access_group_cache_key,
-    project_cache_key,
     tag_cache_key,
 )
 from litellm.proxy.common_utils.validation_error_body import public_validation_errors
@@ -926,9 +924,7 @@ from litellm.redis.stores.spend_counters import (
     SpendCounterStore,
     end_user_counter,
     is_unavailable,
-    model_access_group_counter,
     org_counter,
-    project_counter,
     tag_counter,
 )
 from litellm.router import router_arguments
@@ -4280,39 +4276,6 @@ async def _prepare_end_user_and_tag_spend_increments(
     return tuple(item for item in results if item is not None)
 
 
-async def _prepare_model_access_group_spend_increments(
-    model_access_groups: Sequence[object],
-    response_cost: float,
-    reserved_counter_keys: set[str],
-) -> tuple[PendingSpendIncrement | BaseException, ...]:
-    """Charge the model access groups that authorized this request.
-
-    Without this the counter auth reads is written only by the reservation path, so
-    ``disable_budget_reservation`` would leave ``_model_access_group_max_budget_check`` enforcing
-    against the DB row's spend, which lags by up to the cache TTL.
-
-    Typed ``object`` rather than ``str`` because the names reach the cost callback out of request
-    metadata, which the coercion upstream filters to a list but not to strings. A non-string that
-    slipped through would build a counter key nothing else ever reads.
-    """
-    unique_groups: Final = tuple(
-        dict.fromkeys(group for group in model_access_groups if group and isinstance(group, str))
-    )
-    results: Final = await asyncio.gather(
-        *(
-            _prepare_unreserved_spend_counter_increment(
-                counter_key=model_access_group_counter(group),
-                source_cache_key=model_access_group_cache_key(group),
-                increment=response_cost,
-                reserved_counter_keys=reserved_counter_keys,
-            )
-            for group in unique_groups
-        ),
-        return_exceptions=True,
-    )
-    return tuple(item for item in results if item is not None)
-
-
 async def _prepare_org_spend_increment(
     org_id: str | None,
     response_cost: float,
@@ -4324,23 +4287,6 @@ async def _prepare_org_spend_increment(
     pending: Final = await _prepare_unreserved_spend_counter_increment(
         counter_key=org_counter(org_id),
         source_cache_key=[f"org_id:{org_id}:with_budget", f"org_id:{org_id}"],
-        increment=response_cost,
-        reserved_counter_keys=reserved_counter_keys,
-    )
-    return (pending,) if pending is not None else ()
-
-
-async def _prepare_project_spend_increment(
-    project_id: str | None,
-    response_cost: float,
-    reserved_counter_keys: set[str],
-) -> tuple[PendingSpendIncrement, ...]:
-    if project_id is None:
-        return ()
-
-    pending: Final = await _prepare_unreserved_spend_counter_increment(
-        counter_key=project_counter(project_id),
-        source_cache_key=project_cache_key(project_id),
         increment=response_cost,
         reserved_counter_keys=reserved_counter_keys,
     )
