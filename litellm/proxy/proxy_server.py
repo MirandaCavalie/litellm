@@ -1030,7 +1030,7 @@ from litellm.proxy.spend_tracking.committed_spend import (
     is_committed_spend_key,
     seed_committed_spend,
 )
-from litellm.proxy.spend_tracking.native_spend_counters import (
+from litellm.proxy.spend_tracking.rust_spend_counters import (
     CachedWindowsTask,
     CommittedTask,
     CounterTask,
@@ -1040,14 +1040,14 @@ from litellm.proxy.spend_tracking.native_spend_counters import (
     WindowedEntity,
     plan_spend_counters,
 )
-from litellm.proxy.spend_tracking.native_spend_counters import (
-    committed_counter_keys as native_committed_counter_keys,
+from litellm.proxy.spend_tracking.rust_spend_counters import (
+    committed_counter_keys as rust_committed_counter_keys,
 )
-from litellm.proxy.spend_tracking.native_spend_counters import (
-    post_call_counter_keys as native_post_call_counter_keys,
+from litellm.proxy.spend_tracking.rust_spend_counters import (
+    post_call_counter_keys as rust_post_call_counter_keys,
 )
-from litellm.proxy.spend_tracking.native_spend_counters import (
-    window_counter as native_window_counter,
+from litellm.proxy.spend_tracking.rust_spend_counters import (
+    window_counter as rust_window_counter,
 )
 from litellm.proxy.spend_tracking.spend_capture_rate import (
     run_scheduled_spend_capture_rate_check,
@@ -3773,7 +3773,7 @@ async def increment_spend_counters(
     """
     with spend_counter_batch_scope(
         spend_counter_store,
-        counter_keys=native_post_call_counter_keys(
+        counter_keys=rust_post_call_counter_keys(
             token=token,
             team_id=team_id,
             user_id=user_id,
@@ -4319,7 +4319,7 @@ async def _increment_spend_counters_from_plan(  # noqa: C901  # mirrors the froz
     customer_counters: Sequence[BudgetCounter] = (),
 ) -> None:
     committed_counter_keys: Final = (
-        native_committed_counter_keys(committed_spend_scope.tracked(), response_cost)
+        rust_committed_counter_keys(committed_spend_scope.tracked(), response_cost)
         if committed_spend_scope is not None
         else ()
     )
@@ -4380,7 +4380,7 @@ async def _increment_spend_counters_from_plan(  # noqa: C901  # mirrors the froz
             if fields is not None
             else _UNTYPED_VALUE.validate_python(getattr(window, "budget_duration", None))
         )
-        counter: Final = native_window_counter(
+        counter: Final = rust_window_counter(
             _WINDOWED_ENTITIES[entity_type], entity_id, duration, reserved_counter_keys
         )
         return await _resolved_window_increment(

@@ -1,3 +1,6 @@
+//! The post-call spend counter fan-out from `litellm-callbacks-budgets`, exposed as plain functions
+//! that take and return Python dicts and lists. The proxy validates each reply into typed models.
+
 use litellm_callbacks_budgets::{
     Charge, CustomerScopeSpend, WindowedEntity, committed_counter_keys, customer_settlement, plan,
     post_call_counter_keys, window_counters,

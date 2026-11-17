@@ -4,7 +4,7 @@ from typing import Final
 
 from pydantic import ValidationError
 
-from litellm.proxy.spend_tracking.native_spend_counters import customer_settlement
+from litellm.proxy.spend_tracking.rust_spend_counters import customer_settlement
 from litellm.redis.stores.spend_counters import SpendCounterStore
 from litellm.types.proxy.auth.customer_hierarchy import CustomerHierarchyAuth, CustomerScopeAuth
 

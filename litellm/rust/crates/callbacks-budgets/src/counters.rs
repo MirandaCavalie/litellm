@@ -1,7 +1,13 @@
+//! The post-call spend counter fan-out: which `spend:*` counters one charged request bumps.
+//!
+//! The functions here are pure. They pick every counter key for a charge, skip the ones a budget
+//! reservation already holds, name the auth cache entries a cold counter falls back to, and say
+//! which scopes may warm their counters concurrently. The proxy runs the plan's warm checks,
+//! seeds and the single `INCRBYFLOAT` pipeline through its spend counter store.
+
 use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 const COMMITTED_TWIN_PREFIXES: [&str; 5] = [
@@ -12,6 +18,8 @@ const COMMITTED_TWIN_PREFIXES: [&str; 5] = [
     "spend:end_user:",
 ];
 
+/// One charged request as the proxy's cost callback sees it. A tag or access group that is not a
+/// string arrives as `None` and names no counter.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Charge {
@@ -21,14 +29,16 @@ pub struct Charge {
     pub org_id: Option<String>,
     pub end_user_id: Option<String>,
     pub project_id: Option<String>,
-    pub tags: Option<Vec<Value>>,
-    pub model_access_groups: Option<Vec<Value>>,
+    pub tags: Option<Vec<Option<String>>>,
+    pub model_access_groups: Option<Vec<Option<String>>>,
     pub response_cost: Option<f64>,
     pub reserved_counter_keys: Vec<String>,
     pub committed_counter_keys: Vec<String>,
     pub customer_windows: Vec<CustomerWindow>,
 }
 
+/// A customer hierarchy budget counter the request was admitted against. Only the ones with a
+/// `window_duration` are window counters the fan-out charges.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CustomerWindow {
@@ -37,6 +47,8 @@ pub struct CustomerWindow {
     pub window_duration: Option<String>,
 }
 
+/// An entity whose budget windows live on its cached auth object. The strum string is the entity
+/// label the window reseed reads spend logs by.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, strum::IntoStaticStr)]
 pub enum WindowedEntity {
     #[serde(rename = "key")]
@@ -50,6 +62,12 @@ pub enum WindowedEntity {
     User,
 }
 
+/// One step of a scope, run by the proxy.
+///
+/// `Counter` warms a lifetime counter and charges it. `CachedWindows` reads the entity's budget
+/// windows from the auth cache and charges each through [`window_counters`], or defers to the
+/// stored row when the entity is not cached. `CustomerWindow` charges the customer counter at
+/// `index` of the charge's `customer_windows`. `Committed` seeds and charges the committed twins.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(tag = "task", rename_all = "snake_case")]
 pub enum Task {
@@ -73,6 +91,8 @@ pub enum Task {
     },
 }
 
+/// A group of tasks for one entity. A sequential scope stops at its first failure and drops what it
+/// already prepared. A concurrent scope runs every task and keeps each failure as its own item.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Scope {
     pub concurrent: bool,
@@ -95,11 +115,13 @@ impl Scope {
     }
 }
 
+/// Every scope one charge touches, in the order their increments join the pipeline.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ChargePlan {
     pub scopes: Vec<Scope>,
 }
 
+/// One budget window's counter, and whether a reservation already holds it.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct WindowCounter {
     pub counter_key: String,
@@ -107,6 +129,8 @@ pub struct WindowCounter {
     pub reserved: bool,
 }
 
+/// Whether a counter keeps a charges-only committed twin: lifetime key, team, user, org and end
+/// user counters, never a window.
 pub fn has_committed_twin(counter_key: &str) -> bool {
     COMMITTED_TWIN_PREFIXES
         .iter()
@@ -114,6 +138,7 @@ pub fn has_committed_twin(counter_key: &str) -> bool {
         && !counter_key.contains(":window:")
 }
 
+/// The committed twin's key, `spend:committed:` followed by the counter's key past `spend:`.
 pub fn committed_twin(counter_key: &str) -> String {
     format!(
         "spend:committed:{}",
@@ -121,6 +146,7 @@ pub fn committed_twin(counter_key: &str) -> String {
     )
 }
 
+/// The tracked counters whose committed twin takes this charge, none unless the cost is positive.
 pub fn committed_counter_keys(tracked: &[String], response_cost: Option<f64>) -> Vec<String> {
     match response_cost {
         Some(cost) if cost > 0.0 => tracked
@@ -132,19 +158,19 @@ pub fn committed_counter_keys(tracked: &[String], response_cost: Option<f64>) ->
     }
 }
 
-fn named(values: Option<&[Value]>) -> Vec<String> {
+fn named(values: Option<&[Option<String>]>) -> Vec<String> {
     let mut seen = HashSet::new();
     values
         .unwrap_or_default()
         .iter()
-        .filter_map(|value| match value {
-            Value::String(name) if !name.is_empty() => Some(name.clone()),
-            _ => None,
-        })
-        .filter(|name| seen.insert(name.clone()))
+        .flatten()
+        .filter(|name| !name.is_empty() && seen.insert(name.as_str()))
+        .cloned()
         .collect()
 }
 
+/// Every counter the fan-out warms, bound to the batch read before the database write so the
+/// warm checks share one `MGET`. Budget windows bind when they are read.
 pub fn post_call_counter_keys(charge: &Charge) -> Vec<String> {
     let entity = [
         charge
@@ -201,6 +227,7 @@ pub fn post_call_counter_keys(charge: &Charge) -> Vec<String> {
         .collect()
 }
 
+/// The cost the fan-out charges, `None` when there is no cost or it is zero.
 pub fn charged(response_cost: Option<f64>) -> Option<f64> {
     response_cost.filter(|cost| *cost != 0.0)
 }
@@ -215,15 +242,12 @@ fn hashed_token(token: &str) -> String {
 
 fn entity_label(entity_type: &str) -> String {
     match entity_type {
-        "key" | "team" | "user" => {
-            let mut chars = entity_type.chars();
-            chars
-                .next()
-                .map(|first| first.to_uppercase().chain(chars).collect())
-                .unwrap_or_default()
-        }
-        other => other.to_owned(),
+        "key" => "Key",
+        "team" => "Team",
+        "user" => "User",
+        other => other,
     }
+    .to_owned()
 }
 
 struct Planner<'a> {
@@ -239,6 +263,7 @@ impl Planner<'_> {
     }
 }
 
+/// The scopes and tasks for one charge, with reserved counters already left out.
 pub fn plan(charge: &Charge) -> ChargePlan {
     let planner = Planner {
         reserved: charge
@@ -360,6 +385,7 @@ pub fn plan(charge: &Charge) -> ChargePlan {
     ChargePlan { scopes }
 }
 
+/// The counter for each of an entity's budget windows, named by its duration.
 pub fn window_counters(
     entity_type: WindowedEntity,
     entity_id: &str,
@@ -383,6 +409,7 @@ pub fn window_counters(
         .collect()
 }
 
+/// A customer scope's lifetime or period counter and the spend its auth snapshot recorded.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CustomerScopeSpend {
@@ -390,12 +417,15 @@ pub struct CustomerScopeSpend {
     pub spend: f64,
 }
 
+/// The writes that settle one charge on the customer counters: cold counters are seeded with their
+/// snapshot spend first, then every scope takes the cost.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct CustomerSettlement {
     pub seeds: Vec<(String, f64)>,
     pub increments: Vec<(String, f64)>,
 }
 
+/// Seeds every counter whose reading came back empty, then charges every scope.
 pub fn customer_settlement(
     scopes: &[CustomerScopeSpend],
     readings: &[Option<f64>],
@@ -418,7 +448,6 @@ pub fn customer_settlement(
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
-    use serde_json::json;
 
     use super::*;
 
@@ -449,13 +478,13 @@ mod tests {
             end_user_id: Some("eu1".into()),
             project_id: Some("p1".into()),
             tags: Some(vec![
-                json!("a"),
-                json!(""),
-                json!(3),
-                json!("b"),
-                json!("a"),
+                Some("a".into()),
+                Some(String::new()),
+                None,
+                Some("b".into()),
+                Some("a".into()),
             ]),
-            model_access_groups: Some(vec![json!("g"), json!(null), json!("g")]),
+            model_access_groups: Some(vec![Some("g".into()), None, Some("g".into())]),
             response_cost: Some(1.5),
             committed_counter_keys: vec!["spend:key:hashed".into()],
             customer_windows: vec![
@@ -577,8 +606,8 @@ mod tests {
     #[case::empty_groups_have_no_scope(None, Some(vec![]), 0)]
     #[case::no_tags_no_scope(None, None, 0)]
     fn empty_lists_follow_the_python_truthiness(
-        #[case] tags: Option<Vec<Value>>,
-        #[case] model_access_groups: Option<Vec<Value>>,
+        #[case] tags: Option<Vec<Option<String>>>,
+        #[case] model_access_groups: Option<Vec<Option<String>>>,
         #[case] scopes: usize,
     ) {
         let plan = plan(&Charge {
