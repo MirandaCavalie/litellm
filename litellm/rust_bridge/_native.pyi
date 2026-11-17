@@ -1838,6 +1838,27 @@ class RustModelAccessGroupStore:
     def budgets(self, names: Sequence[str]) -> Future[list[tuple[str, float, float | None, bool]]]: ...
 
 @final
+class RustProjectStore:
+    def __new__(cls, database: NativeDatabase) -> RustProjectStore: ...
+    def find(self, project_id: str) -> Future[str | None]: ...
+
+@final
+class RustTagStore:
+    def __new__(cls, database: NativeDatabase) -> RustTagStore: ...
+    def names(self, limit: int) -> Future[list[str]]: ...
+    def find_many(self, names: Sequence[str]) -> Future[list[str]]: ...
+
+@final
+class RustAccessGroupStore:
+    def __new__(cls, database: NativeDatabase) -> RustAccessGroupStore: ...
+    def find(self, access_group_id: str, *, use_writer: bool = False) -> Future[str | None]: ...
+
+@final
+class RustObjectPermissionStore:
+    def __new__(cls, database: NativeDatabase) -> RustObjectPermissionStore: ...
+    def find(self, object_permission_id: str, *, use_writer: bool = False) -> Future[str | None]: ...
+
+@final
 class NativeTokenRedactor:
     def __new__(cls, minimum_custom_key_length: int, word_ranges: Sequence[tuple[int, int]]) -> NativeTokenRedactor: ...
     def redact(self, text: str, replacement: str) -> str | None: ...
@@ -2070,6 +2091,7 @@ __all__ = [
     "ResponsesWebSocketConnection",
     "RouterCall",
     "RouterCoreHandle",
+    "RustAccessGroupStore",
     "RustAuth",
     "RustAuthOutcome",
     "RustAuthSettings",
@@ -2084,7 +2106,10 @@ __all__ = [
     "RustKeyStore",
     "RustMappedClaims",
     "RustModelAccessGroupStore",
+    "RustObjectPermissionStore",
     "RustPlan",
+    "RustProjectStore",
+    "RustTagStore",
     "RustTeamGrant",
     "RustUpstreamError",
     "SpendRead",
