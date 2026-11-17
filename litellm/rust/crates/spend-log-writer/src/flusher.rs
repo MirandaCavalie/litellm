@@ -43,7 +43,8 @@ pub enum WriteError {
 
 pub fn is_transient(error: &Error) -> bool {
     match error {
-        Error::Query(sqlx::Error::Io(_) | sqlx::Error::Tls(_) | sqlx::Error::PoolClosed) => true,
+        Error::Query(sqlx::Error::Io(_) | sqlx::Error::Tls(_) | sqlx::Error::PoolClosed)
+        | Error::PoolUnreachable => true,
         error => error.sqlstate().is_some_and(|code| {
             TRANSIENT_SQLSTATES.contains(&code.as_str()) || code.starts_with("08")
         }),
@@ -317,11 +318,17 @@ mod tests {
         assert_eq!(started.elapsed(), Duration::from_secs(1 + 2 + 4));
     }
 
+    fn pool_outage() -> Error {
+        Error::PoolUnreachable
+    }
+
     #[rstest]
-    #[case::connect_error()]
+    #[case::connect_error(connect_error)]
+    #[case::pool_outage(pool_outage)]
     #[tokio::test(start_paused = true)]
-    async fn gives_up_after_three_retries_and_asks_for_a_requeue() {
-        let (flusher, recording) = flusher(FakeStore::new(Box::new(|_, _| Some(connect_error()))));
+    async fn gives_up_after_three_retries_and_asks_for_a_requeue(#[case] error: fn() -> Error) {
+        let (flusher, recording) = flusher(FakeStore::new(Box::new(move |_, _| Some(error()))));
+        let started = tokio::time::Instant::now();
 
         let failure = flusher
             .write(&rows(2), None)
@@ -330,6 +337,7 @@ mod tests {
 
         assert!(failure.requeue);
         assert_eq!(flusher.store.calls().statements.len(), 4);
+        assert_eq!(started.elapsed(), Duration::from_secs(1 + 2 + 4));
         let events = recording.0.lock().expect("recording lock");
         assert_eq!(events.len(), 4);
         assert!(
@@ -344,6 +352,7 @@ mod tests {
     #[rstest]
     #[case::systemic_database_error(sqlstate("42P01"), true)]
     #[case::capacity(sqlstate("53300"), true)]
+    #[case::full_pool(Error::Query(sqlx::Error::PoolTimedOut), true)]
     #[case::invalid_payload(Error::InvalidSpendLogDelivery("bad".into()), false)]
     #[tokio::test(start_paused = true)]
     async fn a_non_transient_error_fails_on_the_first_attempt(
@@ -523,7 +532,8 @@ mod tests {
 
     #[rstest]
     #[case::io(connect_error(), true, false)]
-    #[case::pool_timeout(Error::Query(sqlx::Error::PoolTimedOut), false, false)]
+    #[case::pool_full(Error::Query(sqlx::Error::PoolTimedOut), false, false)]
+    #[case::pool_outage(Error::PoolUnreachable, true, false)]
     #[case::lifecycle(sqlstate("57P03"), true, false)]
     #[case::connection_exception(sqlstate("08006"), true, false)]
     #[case::unique_violation(sqlstate("23505"), false, true)]

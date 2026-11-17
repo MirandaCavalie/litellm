@@ -67,7 +67,10 @@ impl PgLedgerStore {
 
 impl LedgerStore for PgLedgerStore {
     async fn insert_with_deliveries(&self, rows: &[SpendLogRow]) -> Result<usize, Error> {
-        let result = self.insert(rows).await;
+        let result = self
+            .insert(rows)
+            .await
+            .map_err(|error| error.explaining_pool_timeout(self.pools.writer()));
         if let Err(error) = &result {
             self.pools.recycle_after(error);
         }

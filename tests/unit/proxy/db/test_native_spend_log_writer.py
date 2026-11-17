@@ -1,4 +1,5 @@
 import asyncio
+import time
 from collections.abc import AsyncIterator, Mapping, Sequence
 from typing import Final
 from unittest.mock import AsyncMock, MagicMock
@@ -24,6 +25,8 @@ from litellm.proxy.utils import (
 from litellm.rust_bridge._native import NativeDatabase, NativeSpendLogWriteFailure, NativeSpendLogWriter
 
 _UNREACHABLE: Final = "postgresql://litellm:secret@db.invalid:5432/proxy?pool_timeout=1"
+_REFUSED: Final = "postgresql://litellm:secret@127.0.0.1:1/proxy?pool_timeout=1"
+_RETRY_SLEEPS_SECONDS: Final = 1 + 2 + 4
 _LEDGER_ON: Final[Mapping[str, object]] = {"use_spend_logs_ledger": True}
 
 
@@ -46,10 +49,10 @@ class FakePrismaClient:
         return obj
 
 
-async def _unreachable_database() -> NativeDatabase:
+async def _unreachable_database(url: str = _UNREACHABLE) -> NativeDatabase:
     return await NativeDatabase.connect(
         ServiceLoggingEvents(loop=asyncio.get_running_loop(), service_logging=lambda: None),
-        native_endpoint(_UNREACHABLE, tls_offered=False, max_connections=1).endpoint,
+        native_endpoint(url, tls_offered=False, max_connections=1).endpoint,
         None,
     )
 
@@ -149,20 +152,27 @@ async def test_overflow_drops_the_same_rows_and_keeps_the_same_charges_as_the_py
 
 
 @pytest.mark.asyncio
-async def test_an_outage_requeues_the_batch_at_the_head_and_reports_the_failure(
-    installed: tuple[FakePrismaClient, NativeSpendLogWriter],
-) -> None:
-    client, _ = installed
+@pytest.mark.parametrize("url", [_UNREACHABLE, _REFUSED], ids=["unresolvable_host", "refused_connect"])
+async def test_an_outage_is_retried_three_times_then_requeued_at_the_head(url: str) -> None:
+    client: Final = FakePrismaClient()
+    writer: Final = await install_native_spend_log_writer(client, await _unreachable_database(url), _LEDGER_ON, None)
     proxy_logging_obj: Final = _proxy_logging()
     rows: Final = [_row("a", accounting_payload={"spend": 1.5}), _row("b")]
     await enqueue_spend_logs(client, rows)
+    started: Final = time.monotonic()
 
     with pytest.raises(NativeSpendLogWriteFailure) as failure:
         await update_spend(client, None, proxy_logging_obj)
+    elapsed: Final = time.monotonic() - started
     await asyncio.sleep(0)
+    requeued: Final = await dequeue_spend_logs(client, 10)
+    uninstall_native_spend_log_writer(client)
 
+    assert writer is not None
     assert failure.value.requeue is True
-    assert await dequeue_spend_logs(client, 10) == rows
+    assert failure.value.kind == "unreachable"
+    assert elapsed >= _RETRY_SLEEPS_SECONDS
+    assert requeued == rows
     assert proxy_logging_obj.failure_handler.await_count == 1
 
 
