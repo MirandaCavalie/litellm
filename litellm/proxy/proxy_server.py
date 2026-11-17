@@ -1044,6 +1044,7 @@ from litellm.proxy.spend_tracking.spend_counter_batch import (
     record_spend_counter_value,
     spend_counter_batch_scope,
 )
+from litellm.proxy.spend_tracking.spend_logs_ledger_setting import capture_spend_logs_ledger_setting
 from litellm.proxy.spend_tracking.spend_management_endpoints import (
     router as spend_management_router,
 )
@@ -1771,6 +1772,7 @@ async def _proxy_lifespan(app: FastAPI, resources: AsyncExitStack) -> AsyncGener
                 await initialize_from_worker_config(decoded_worker_config)
 
     enforce_fips_mode(general_settings_view())
+    resources.callback(capture_spend_logs_ledger_setting(general_settings_view()))
 
     async with AsyncExitStack() as boot_database:
         enforce_master_key_boot_verdict(
