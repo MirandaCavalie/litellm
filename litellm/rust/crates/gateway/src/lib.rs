@@ -3,6 +3,7 @@ mod error;
 mod health;
 mod license;
 mod redis;
+pub mod screen;
 mod state;
 pub use error::Error;
 pub use license::build_license;
