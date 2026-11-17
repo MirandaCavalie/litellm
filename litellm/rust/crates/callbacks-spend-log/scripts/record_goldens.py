@@ -97,6 +97,7 @@ def _install() -> None:
         with (
             mock.patch("time.time", return_value=FIXED_NOW),
             mock.patch.object(spend_tracking_utils_uuid(), "uuid4", fixed_uuid),
+            mock.patch.object(spend_tracking_utils, "uses_spend_logs_ledger", return_value=False),
         ):
             result = original_payload(kwargs, response_obj, start_time, end_time, llm_router)
         if "input" in record:
@@ -206,6 +207,7 @@ def _install() -> None:
                 _add("ledger_rows", {"output_error": str(error)})
         return result
 
+    native_spend_log_rows.ledger_spend_log_row = native_spend_log_rows._python_ledger_row
     spend_tracking_utils.get_logging_payload = recording_payload
     spend_tracking_utils.get_logging_payload_async = recording_payload_async
     snapshot.build_accounting_payload = recording_accounting

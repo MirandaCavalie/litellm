@@ -3,18 +3,21 @@ import os
 import re
 import sys
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
-from typing import TYPE_CHECKING, Final, Literal
+from typing import TYPE_CHECKING, Final, Literal, TypeAlias
 
 from pydantic import BaseModel, TypeAdapter
+from typing_extensions import TypeIs  # noqa: TID251  # TypeIs reaches typing only on 3.13
 
 import litellm
 from litellm._uuid import uuid
+from litellm.constants import MINIMUM_CUSTOM_KEY_LENGTH
 from litellm.litellm_core_utils.classifier_logging import classifier_audit_fields
 from litellm.litellm_core_utils.core_helpers import (
-    get_litellm_metadata_from_kwargs,
+    get_litellm_metadata_from_kwargs,  # pyright: ignore[reportUnknownVariableType]  # the helper's dict parameter is untyped upstream
     proxy_stamped_kubernetes_pod_routing,
     proxy_stamped_used_client_oauth_token,
 )
@@ -22,20 +25,26 @@ from litellm.litellm_core_utils.hidden_params import served_from_cache
 from litellm.litellm_core_utils.internal_call_metadata import is_unbilled_non_inference_call
 from litellm.litellm_core_utils.litellm_logging import StandardLoggingPayloadSetup
 from litellm.litellm_core_utils.ptu_pricing import azure_spillover
-from litellm.litellm_core_utils.redact_messages import should_redact_message_logging
+from litellm.litellm_core_utils.redact_messages import (
+    should_redact_message_logging,  # pyright: ignore[reportUnknownVariableType]  # the helper's dict parameter is untyped upstream
+)
+from litellm.litellm_core_utils.safe_json_dumps import safe_json_structure
 from litellm.llms.anthropic.common_utils import resolve_used_client_oauth_token
 from litellm.proxy._types import SpendLogsMetadata, SpendLogsPayload
 from litellm.proxy.route_llm_request import ProxyModelNotFoundError
+from litellm.rust_bridge import _native
 from litellm.secret_managers.main import get_secret_bool
 from litellm.types.utils import LiteLLMBatch, batch_chat_usage
-from litellm.utils import get_end_user_id_for_cost_tracking
+from litellm.utils import (
+    get_end_user_id_for_cost_tracking,  # pyright: ignore[reportUnknownVariableType]  # the helper's dict parameter is untyped upstream
+)
 
 if TYPE_CHECKING:
     from litellm.router import Router
 
 SPEND_LOG_ROW_INPUT_VERSION: Final = 1
-_DATETIME_ROW_FIELDS: Final = ("startTime", "endTime", "completionStartTime")
 _COMPLETION_START_TIME: Final[TypeAdapter[datetime | None]] = TypeAdapter(datetime | None)
+_ROW_METADATA: Final = TypeAdapter(dict[str, object])
 _METADATA_KEYS: Final = frozenset(
     {
         *SpendLogsMetadata.__annotations__,
@@ -110,7 +119,7 @@ _KWARGS_KEYS: Final = (
     "realtime_tools",
     "realtime_tool_calls",
 )
-RouteReason = Literal["message_redaction", "not_plain_data", "compaction_block"]
+RouteReason: TypeAlias = Literal["message_redaction", "not_plain_data", "compaction_block"]
 
 
 class RoutedToPython(Exception):
@@ -119,22 +128,43 @@ class RoutedToPython(Exception):
         self.reason: Final = reason
 
 
+def _is_exact_dict(value: object) -> TypeIs[Mapping[object, object]]:  # guard-ok: the exact type decides it
+    return type(value) is dict
+
+
+def _is_exact_list(value: object) -> TypeIs[Sequence[object]]:  # guard-ok: the exact type decides it
+    return type(value) is list
+
+
+def _is_mapping(value: object) -> TypeIs[Mapping[object, object]]:  # guard-ok: isinstance decides it
+    return isinstance(value, Mapping)
+
+
+def _is_str_mapping(value: object) -> TypeIs[Mapping[str, object]]:  # guard-ok: logging mappings are str-keyed
+    return isinstance(value, Mapping)
+
+
+def _is_array(value: object) -> TypeIs[Sequence[object]]:  # guard-ok: isinstance decides it
+    return isinstance(value, list | tuple)
+
+
+def _is_dict(value: object) -> TypeIs[dict[str, object]]:  # guard-ok: str-keyed  # mutable-ok: main's dict
+    return isinstance(value, dict)
+
+
 def _plain(value: object) -> object:
-    match value:
-        case None | bool() | float():
-            return value
-        case int() if type(value) is int:
-            return value
-        case str() if type(value) is str:
-            try:
-                value.encode()
-            except UnicodeEncodeError:
-                raise RoutedToPython("not_plain_data") from None
-            return value
-        case dict() if type(value) is dict:
-            return {_plain_key(key): _plain(item) for key, item in value.items()}
-        case list() if type(value) is list:
-            return [_plain(item) for item in value]
+    if value is None or isinstance(value, bool | float) or type(value) is int:
+        return value
+    if isinstance(value, str) and type(value) is str:
+        try:
+            value.encode()
+        except UnicodeEncodeError:
+            raise RoutedToPython("not_plain_data") from None
+        return value
+    if _is_exact_dict(value):
+        return {_plain_key(key): _plain(item) for key, item in value.items()}
+    if _is_exact_list(value):
+        return [_plain(item) for item in value]
     raise RoutedToPython("not_plain_data")
 
 
@@ -144,14 +174,25 @@ def _plain_key(key: object) -> str:
     return str(_plain(key))
 
 
-def _projected(source: Mapping[str, object], keys: frozenset[str] | Sequence[str]) -> dict[str, object]:
+def _projected(source: Mapping[str, object], keys: frozenset[str] | Sequence[str]) -> Mapping[str, object]:
     return {key: _plain(value) for key, value in source.items() if key in keys}
 
 
+def _str_mapping(value: object) -> Mapping[str, object] | None:
+    return value if _is_str_mapping(value) else None
+
+
+def _routed_unless_mapping(value: object) -> Mapping[str, object]:
+    mapping: Final = _str_mapping(value)
+    if mapping is None:
+        raise RoutedToPython("not_plain_data")
+    return mapping
+
+
 def _holds_compaction_block(value: object) -> bool:
-    if isinstance(value, Mapping):
+    if _is_mapping(value):
         return value.get("type") == "compaction" or any(_holds_compaction_block(item) for item in value.values())
-    if isinstance(value, list | tuple):
+    if _is_array(value):
         return any(_holds_compaction_block(item) for item in value)
     return False
 
@@ -164,12 +205,19 @@ def _timestamp(value: datetime) -> Mapping[str, object]:
     }
 
 
-def _usage(call_type: object, metadata: Mapping[str, object], response_obj: object, response_obj_dict: dict) -> dict:
-    from litellm.proxy.spend_tracking.spend_tracking_utils import _extract_usage_for_ocr_call
+def _usage(
+    call_type: object,
+    metadata: Mapping[str, object],
+    response_obj: object,
+    response_obj_dict: dict[str, object],  # mutable-ok: forwarded to the OCR usage extractor, which takes a dict
+) -> Mapping[str, object]:
+    from litellm.proxy.spend_tracking.spend_tracking_utils import (
+        _extract_usage_for_ocr_call,  # pyright: ignore[reportPrivateUsage, reportUnknownVariableType]  # the row input reuses the logging payload's own OCR usage extraction
+    )
 
     if call_type in ["ocr", "aocr"]:
-        return _extract_usage_for_ocr_call(response_obj, response_obj_dict)
-    if is_unbilled_non_inference_call(call_type, metadata, response_obj_dict):  # pyright: ignore[reportArgumentType]
+        return _str_mapping(_extract_usage_for_ocr_call(response_obj, response_obj_dict)) or {}  # pyright: ignore[reportUnknownArgumentType]  # the OCR extractor returns an untyped dict
+    if is_unbilled_non_inference_call(call_type, metadata, response_obj_dict):  # pyright: ignore[reportArgumentType]  # call_type is the logged kwargs value, passed as main passes it
         return {}
     chat_usage_of_batch: Final = batch_chat_usage(response_obj) if isinstance(response_obj, LiteLLMBatch) else None
     usage: Final = (
@@ -179,19 +227,18 @@ def _usage(call_type: object, metadata: Mapping[str, object], response_obj: obje
     )
     if isinstance(usage, litellm.Usage):
         return dict(usage)
-    return usage if isinstance(usage, dict) else {}
+    return usage
 
 
-def _final_usage(kwargs: Mapping[str, object], usage: dict) -> dict:
+def _final_usage(kwargs: Mapping[str, object], usage: Mapping[str, object]) -> Mapping[str, object]:
     combined: Final = kwargs.get("combined_usage_object")
-    if (
-        not usage or "continued_partial_usage" in kwargs or "failed_attempts_billed_on_success" in kwargs
-    ) and isinstance(combined, litellm.Usage):
+    replaced: Final = not usage or "continued_partial_usage" in kwargs or "failed_attempts_billed_on_success" in kwargs
+    if replaced and isinstance(combined, litellm.Usage):
         return combined.model_dump()
     return usage
 
 
-def _usage_values(usage: Mapping[str, object]) -> dict[str, object]:
+def _usage_values(usage: Mapping[str, object]) -> Mapping[str, object]:
     return {key: value.model_dump() if isinstance(value, BaseModel) else value for key, value in usage.items()}
 
 
@@ -227,7 +274,7 @@ def _plain_setting(value: object) -> object:
 
 
 def spend_log_row_input(
-    kwargs: dict,
+    kwargs: dict[str, object],  # mutable-ok: the logging kwargs as litellm hands them over, only read here
     response_obj: object,
     start_time: datetime,
     end_time: datetime,
@@ -236,10 +283,10 @@ def spend_log_row_input(
     fallback_session_id: str,
 ) -> Mapping[str, object]:
     from litellm.proxy.spend_tracking.spend_tracking_utils import (
-        _caller_session_for_spend_log,
-        _is_configured_model_group,
-        _model_group_provider,
-        _string_or_empty,
+        _caller_session_for_spend_log,  # pyright: ignore[reportPrivateUsage]  # the row input reuses the logging payload's own lookups
+        _is_configured_model_group,  # pyright: ignore[reportPrivateUsage]  # the row input reuses the logging payload's own lookups
+        _model_group_provider,  # pyright: ignore[reportPrivateUsage]  # the row input reuses the logging payload's own lookups
+        _string_or_empty,  # pyright: ignore[reportPrivateUsage]  # the row input reuses the logging payload's own lookups
         get_spend_logs_id,
         should_store_prompts_and_responses_in_spend_logs,
     )
@@ -249,31 +296,29 @@ def spend_log_row_input(
         response_obj.spend_log_error_message if isinstance(response_obj, ProxyModelNotFoundError) else None
     )
     response_served_from_cache: Final = served_from_cache(response_obj)
-    if response_obj is None:
-        response_obj = {}
-    elif not isinstance(response_obj, BaseModel) and not isinstance(response_obj, dict):
-        response_obj = {"result": str(response_obj)}
-    litellm_params: Final = kwargs.get("litellm_params", {})
-    metadata: Final = get_litellm_metadata_from_kwargs(kwargs)
-    routing_litellm_params: Final[Mapping[str, object] | None] = (
-        litellm_params if isinstance(litellm_params, Mapping) else None
-    )
-    routing_metadata: Final[object] = (
-        routing_litellm_params.get("metadata") if routing_litellm_params is not None else None
-    )
-    completion_start_time: Final = _COMPLETION_START_TIME.validate_python(kwargs.get("completion_start_time", end_time))
-    call_type: Final = kwargs.get("call_type")
-    response_obj_dict: Final = (
-        response_obj
-        if isinstance(response_obj, dict)
+    response_obj_dict: Final[dict[str, object]] = (  # mutable-ok: the response dict main's extractors take
+        {}
+        if response_obj is None
+        else response_obj
+        if _is_dict(response_obj)
         else response_obj.model_dump()
         if isinstance(response_obj, BaseModel)
-        else {}
+        else {"result": str(response_obj)}
     )
-    usage: Final = _final_usage(kwargs, _usage(call_type, metadata, response_obj, response_obj_dict))
-    request_id: Final = get_spend_logs_id(call_type or "acompletion", response_obj_dict, kwargs, metadata)
-    standard_logging_payload: Final = kwargs.get("standard_logging_object", None)
-    payload: Final = standard_logging_payload if isinstance(standard_logging_payload, Mapping) else None
+    response: Final = response_obj if isinstance(response_obj, BaseModel) else response_obj_dict
+    litellm_params: Final = _routed_unless_mapping(kwargs.get("litellm_params", {}))
+    metadata: Final = _routed_unless_mapping(get_litellm_metadata_from_kwargs(kwargs))  # pyright: ignore[reportUnknownArgumentType]  # the metadata helper returns an untyped dict
+    routing_metadata: Final = litellm_params.get("metadata")
+    completion_start_time: Final = _COMPLETION_START_TIME.validate_python(kwargs.get("completion_start_time", end_time))
+    call_type: Final = kwargs.get("call_type")
+    usage: Final = _final_usage(kwargs, _usage(call_type, metadata, response, response_obj_dict))
+    request_id: Final = get_spend_logs_id(
+        call_type or "acompletion",  # pyright: ignore[reportArgumentType]  # passed as the logging payload passes it
+        response_obj_dict,
+        kwargs,
+        metadata,
+    )
+    payload: Final = _str_mapping(kwargs.get("standard_logging_object", None))
 
     stores_prompts: Final = should_store_prompts_and_responses_in_spend_logs(metadata)
     if stores_prompts and should_redact_message_logging(
@@ -283,9 +328,7 @@ def spend_log_row_input(
         }
     ):
         raise RoutedToPython("message_redaction")
-    proxy_server_request: Final = (
-        litellm_params.get("proxy_server_request") if isinstance(litellm_params, Mapping) else None
-    )
+    proxy_server_request: Final = litellm_params.get("proxy_server_request")
     if stores_prompts and (
         _holds_compaction_block(payload.get("response") if payload is not None else None)
         or _holds_compaction_block(proxy_server_request)
@@ -302,16 +345,17 @@ def spend_log_row_input(
     )
     model_group_provider: Final = None if logged_provider else _model_group_provider(model_group, llm_router)
     custom_llm_provider: Final = logged_provider or model_group_provider
-    payload_metadata: Final = payload.get("metadata") if payload is not None else None
-    hidden_params: Final = payload.get("hidden_params") if payload is not None else None
-    response_headers: Final = kwargs.get("response_headers")
+    payload_metadata: Final = _str_mapping(payload.get("metadata")) if payload is not None else None
+    hidden_params: Final = _str_mapping(payload.get("hidden_params")) if payload is not None else None
+    response_headers: Final = _str_mapping(kwargs.get("response_headers"))
 
-    if litellm.cache is None:
-        cache_key: object = "Cache OFF"
-    elif litellm_params.get("preset_cache_key") is not None:
-        cache_key = litellm_params["preset_cache_key"]
-    else:
-        cache_key = litellm.cache.get_cache_key(**kwargs)
+    cache_key: Final = (
+        "Cache OFF"
+        if litellm.cache is None
+        else litellm_params["preset_cache_key"]
+        if litellm_params.get("preset_cache_key") is not None
+        else litellm.cache.get_cache_key(**kwargs)
+    )
 
     return {
         "version": SPEND_LOG_ROW_INPUT_VERSION,
@@ -341,21 +385,13 @@ def spend_log_row_input(
             ),
             **(
                 {"metadata": _projected(payload_metadata, _PAYLOAD_METADATA_KEYS)}
-                if isinstance(payload_metadata, Mapping)
+                if payload_metadata is not None
                 else {}
             ),
-            **(
-                {"hidden_params": _projected(hidden_params, _HIDDEN_PARAMS_KEYS)}
-                if isinstance(hidden_params, Mapping)
-                else {}
-            ),
+            **({"hidden_params": _projected(hidden_params, _HIDDEN_PARAMS_KEYS)} if hidden_params is not None else {}),
         },
         "cache_key": _plain(cache_key),
-        "end_user_id": _plain(
-            get_end_user_id_for_cost_tracking(
-                dict(litellm_params) if isinstance(litellm_params, Mapping) else litellm_params
-            )
-        ),
+        "end_user_id": _plain(get_end_user_id_for_cost_tracking(dict(litellm_params))),
         "model_group_provider": model_group_provider,
         "is_configured_model_group": _is_configured_model_group(model_group, llm_router)
         if metadata.get("status") == "failure"
@@ -364,16 +400,15 @@ def spend_log_row_input(
         if litellm.request_correlation_in_logs
         else None,
         "used_client_oauth_token": resolve_used_client_oauth_token(
-            proxy_stamped_used_client_oauth_token(litellm_params.get("metadata"), litellm_params), custom_llm_provider
+            proxy_stamped_used_client_oauth_token(litellm_params.get("metadata"), litellm_params),
+            custom_llm_provider,  # pyright: ignore[reportArgumentType]  # passed as the logging payload passes it
         ),
-        "kubernetes_pod_routing": _plain(
-            proxy_stamped_kubernetes_pod_routing(routing_metadata, routing_litellm_params)
-        ),
+        "kubernetes_pod_routing": _plain(proxy_stamped_kubernetes_pod_routing(routing_metadata, litellm_params)),
         "azure_spillover": _plain(
             azure_spillover(
-                response_headers=response_headers if isinstance(response_headers, Mapping) else None,
-                additional_headers=hidden_params.get("additional_headers")
-                if isinstance(hidden_params, Mapping)
+                response_headers=response_headers,
+                additional_headers=hidden_params.get("additional_headers")  # pyright: ignore[reportArgumentType]  # passed as the logging payload passes it
+                if hidden_params is not None
                 else None,
             )
         ),
@@ -382,7 +417,11 @@ def spend_log_row_input(
 
 
 def current_spend_log_row_input(
-    kwargs: dict, response_obj: object, start_time: datetime, end_time: datetime, llm_router: "Router | None"
+    kwargs: dict[str, object],  # mutable-ok: the logging kwargs as litellm hands them over, only read here
+    response_obj: object,
+    start_time: datetime,
+    end_time: datetime,
+    llm_router: "Router | None",
 ) -> Mapping[str, object]:
     return spend_log_row_input(kwargs, response_obj, start_time, end_time, llm_router, time.time(), str(uuid.uuid4()))
 
@@ -392,9 +431,113 @@ def encode_row_input(value: Mapping[str, object]) -> str:
 
 
 def decode_row(row_json: str) -> SpendLogsPayload:
-    row: Final = json.loads(row_json)
-    for field in _DATETIME_ROW_FIELDS:
-        value = row.get(field)
-        if isinstance(value, str):
-            row[field] = datetime.fromisoformat(value)
+    row: Final[SpendLogsPayload] = json.loads(row_json)  # pyright: ignore[reportAny]  # the native builder returns the row as a JSON object
+    start_time: Final = row["startTime"]
+    end_time: Final = row["endTime"]
+    completion_start_time: Final = row["completionStartTime"]
+    if isinstance(start_time, str):
+        row["startTime"] = datetime.fromisoformat(start_time)
+    if isinstance(end_time, str):
+        row["endTime"] = datetime.fromisoformat(end_time)
+    if isinstance(completion_start_time, str):
+        row["completionStartTime"] = datetime.fromisoformat(completion_start_time)
     return row
+
+
+@dataclass(frozen=True, slots=True)
+class LedgerRowInput:
+    billable_cost: float | None
+    org_id: str | None
+    team_id: str | None
+    delivery_id: str
+    entities: Mapping[str, str | None]
+    model_access_groups: Sequence[str]
+    windows: Sequence[Mapping[str, object]]
+    router: "Callable[[], Router | None]"
+
+
+def uses_spend_logs_ledger() -> bool:
+    from litellm.proxy.proxy_server import general_settings_view
+
+    return general_settings_view().get("use_spend_logs_ledger", True) is not False
+
+
+@lru_cache(maxsize=8)
+def _row_builder(settings_json: str) -> _native.NativeSpendLogRowBuilder:
+    return _native.NativeSpendLogRowBuilder(settings_json, MINIMUM_CUSTOM_KEY_LENGTH, token_word_ranges())
+
+
+def native_logging_payload(
+    kwargs: dict[str, object],  # mutable-ok: the logging kwargs as litellm hands them over, only read here
+    response_obj: object,
+    start_time: datetime,
+    end_time: datetime,
+    llm_router: "Router | None",
+) -> SpendLogsPayload | None:
+    try:
+        row_input: Final = current_spend_log_row_input(kwargs, response_obj, start_time, end_time, llm_router)
+    except RoutedToPython:
+        return None
+    return decode_row(_row_builder(json.dumps(spend_log_row_config())).build_row(json.dumps(row_input)))
+
+
+def _json_structure(value: object) -> object:
+    return json.loads(json.dumps(safe_json_structure(value)))  # pyright: ignore[reportAny]  # a JSON value read back as object
+
+
+def _ledger_row_plain(payload: Mapping[str, object]) -> Mapping[str, object]:
+    return {key: value.isoformat() if isinstance(value, datetime) else _plain(value) for key, value in payload.items()}
+
+
+def _python_ledger_row(payload: SpendLogsPayload, ledger: LedgerRowInput) -> SpendLogsPayload:
+    from litellm.accounting.snapshot import build_accounting_payload
+    from litellm.proxy.db.db_spend_update_writer import (
+        _is_settle_once_cost_row,  # pyright: ignore[reportPrivateUsage]  # the fallback reuses the writer's own settle-once rule
+        _iso_timestamp,  # pyright: ignore[reportPrivateUsage]  # the fallback reuses the writer's own timestamp form
+    )
+
+    row: Final = payload.copy()
+    row["spend"] = ledger.billable_cost or 0.0
+    row["startTime"] = _iso_timestamp(payload["startTime"])
+    row["endTime"] = _iso_timestamp(payload["endTime"])
+    if ledger.org_id:
+        row["organization_id"] = ledger.org_id
+    if ledger.team_id:
+        row["team_id"] = ledger.team_id
+    if not _is_settle_once_cost_row(row):
+        row["accounting_delivery_id"] = ledger.delivery_id
+    row["accounting_payload"] = build_accounting_payload(
+        row,
+        entities=ledger.entities,
+        model_access_groups=ledger.model_access_groups,
+        windows=ledger.windows,
+        router=ledger.router,
+    )
+    return row
+
+
+def ledger_spend_log_row(payload: SpendLogsPayload, ledger: LedgerRowInput) -> SpendLogsPayload:
+    from litellm.accounting.snapshot import (
+        _savings_or_zero,  # pyright: ignore[reportPrivateUsage]  # savings pricing stays in Python and feeds the native row
+    )
+
+    try:
+        row: Final = _ledger_row_plain(payload)
+    except RoutedToPython:
+        return _python_ledger_row(payload, ledger)
+    ledger_input: Final = {
+        "response_cost": ledger.billable_cost,
+        "org_id": ledger.org_id,
+        "team_id": ledger.team_id,
+        "delivery_id": ledger.delivery_id,
+        "entities": _json_structure(dict(ledger.entities)),
+        "model_access_groups": _json_structure(list(ledger.model_access_groups)),
+        "windows": _json_structure(list(ledger.windows)),
+        "savings": _savings_or_zero(payload, _ROW_METADATA.validate_json(payload["metadata"]), ledger.router)._asdict(),
+    }
+    finalized: Final[SpendLogsPayload] = json.loads(  # pyright: ignore[reportAny]  # the native builder returns the row as a JSON object
+        _native.NativeSpendLogRowBuilder.finalize_ledger_row(json.dumps(row), json.dumps(ledger_input))
+    )
+    if "completionStartTime" in payload:
+        finalized["completionStartTime"] = payload["completionStartTime"]
+    return finalized
