@@ -1,0 +1,11 @@
+import pytest
+
+from tests.unit.proxy.spend_counters_ledger_twin import force_ledger_windows, ledger_scenarios
+from tests.unit.proxy.spend_tracking import test_spend_counter_batch as scenarios
+
+globals().update(ledger_scenarios(scenarios))
+
+
+@pytest.fixture(autouse=True)
+def _ledger_windows(monkeypatch: pytest.MonkeyPatch) -> None:
+    force_ledger_windows(monkeypatch)

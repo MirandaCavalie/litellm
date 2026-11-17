@@ -4,6 +4,7 @@ from typing import Final
 
 from pydantic import ValidationError
 
+from litellm.proxy.spend_tracking.rust_spend_counters import customer_settlement
 from litellm.redis.stores.spend_counters import SpendCounterStore
 from litellm.types.proxy.auth.customer_hierarchy import CustomerHierarchyAuth, CustomerScopeAuth
 
@@ -51,3 +52,22 @@ async def settle_customer_spend(metadata: Mapping[str, object], cost: float, sto
         *(_current_scope(scope, reading[0], store) for scope, reading in zip(hierarchy.scopes, readings, strict=True))
     )
     _ = await store.increment_many(tuple((customer_spend_counter(scope), cost) for scope in hierarchy.scopes))
+
+
+async def settle_customer_spend_from_plan(
+    metadata: Mapping[str, object], cost: float, store: SpendCounterStore
+) -> None:
+    snapshot: Final = metadata.get("user_api_key_customer_hierarchy")
+    if snapshot is None or cost == 0:
+        return
+    try:
+        hierarchy: Final = CustomerHierarchyAuth.model_validate(snapshot)
+    except ValidationError:
+        return
+    counters: Final = tuple((customer_spend_counter(scope), scope.spend) for scope in hierarchy.scopes)
+    readings: Final = await asyncio.gather(*(store.read(counter_key) for counter_key, _ in counters))
+    settlement: Final = customer_settlement(counters, tuple(reading[0] for reading in readings), cost)
+    _ = await asyncio.gather(
+        *(store.seed(counter_key, spend, increment_if_lost=False) for counter_key, spend in settlement.seeds)
+    )
+    _ = await store.increment_many(settlement.increments)

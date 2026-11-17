@@ -1,4 +1,5 @@
 mod auth;
+mod budget_counters;
 mod budgets;
 mod cache;
 mod callable;
@@ -35,6 +36,11 @@ mod _native {
         auth_allowed_routes_grant, auth_first_denied_route, auth_jwt_team_routes_grant,
         auth_managed_agent_route_allowed, auth_managed_route, auth_route_matches_denied,
         auth_route_matches_prefix, auth_route_matches_wildcard,
+    };
+    #[pymodule_export]
+    use crate::budget_counters::{
+        budget_window_counters, committed_spend_counter_keys, customer_spend_settlement,
+        spend_counter_keys, spend_counter_plan,
     };
     #[pymodule_export]
     use crate::budgets::NativeBudgets;

@@ -36,7 +36,7 @@ from litellm.proxy.auth.auth_checks import (
     get_key_object,
     get_team_object,
 )
-from litellm.proxy.auth.customer_spend import settle_customer_spend
+from litellm.proxy.auth.customer_spend import settle_customer_spend, settle_customer_spend_from_plan
 from litellm.proxy.auth.route_checks import RouteChecks
 from litellm.proxy.db.db_lookup_gate import DBLookupDeadlineExceeded
 from litellm.proxy.db.db_spend_update_writer import (
@@ -1487,8 +1487,11 @@ async def _update_database_and_spend_counters_in_batch(
 
     from litellm.proxy.proxy_server import spend_counter_store
 
+    ledger_options: Final = _ledger_counter_options(
+        _BATCH_CALLBACK_FIELDS.validate_python(kwargs).get(ACCOUNTING_LEDGER_KWARG)
+    )
     try:
-        await settle_customer_spend(
+        await (settle_customer_spend_from_plan if ledger_options.get("windows_from_ledger") else settle_customer_spend)(
             _OBJECT_MAPPING.validate_python(get_litellm_metadata_from_kwargs(kwargs=kwargs)),
             response_cost,
             spend_counter_store,
@@ -1518,7 +1521,7 @@ async def _update_database_and_spend_counters_in_batch(
                     end_user_id=end_user_id,
                 )
             ),
-            **_ledger_counter_options(_BATCH_CALLBACK_FIELDS.validate_python(kwargs).get(ACCOUNTING_LEDGER_KWARG)),
+            **ledger_options,
             **_customer_counter_options(customer_counters),
         )
     except Exception:
