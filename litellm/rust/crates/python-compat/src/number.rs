@@ -1,3 +1,6 @@
+//! Python number semantics: `int()` and `float()` parsing of text, `math.fsum`-accurate float
+//! sums, and the float and duration forms the proxy reads from settings.
+
 use std::{str::FromStr, time::Duration};
 
 use num_bigint::BigInt;
@@ -38,6 +41,30 @@ pub fn hex_int(text: &str) -> Option<BigInt> {
     }
     let magnitude = BigInt::parse_bytes(digits.replace('_', "").as_bytes(), 16)?;
     Some(if negative { -magnitude } else { magnitude })
+}
+
+/// `sum(values)` over floats, which CPython 3.12 adds with Neumaier compensation. `None` stands
+/// for the empty sum, where Python returns the `int` 0.
+pub fn float_sum(values: impl IntoIterator<Item = f64>) -> Option<f64> {
+    let mut total: Option<f64> = None;
+    let mut compensation = 0.0;
+    for value in values {
+        let running = total.unwrap_or(0.0);
+        let next = running + value;
+        compensation += if running.abs() >= value.abs() {
+            (running - next) + value
+        } else {
+            (value - next) + running
+        };
+        total = Some(next);
+    }
+    total.map(|total| {
+        if compensation != 0.0 && compensation.is_finite() {
+            total + compensation
+        } else {
+            total
+        }
+    })
 }
 
 /// `float(text)`, or `None` where Python raises `ValueError`.
@@ -129,7 +156,15 @@ mod tests {
 
     use std::time::Duration;
 
-    use super::{SecondsError, float, hex_int, int, seconds};
+    use super::{SecondsError, float, float_sum, hex_int, int, seconds};
+
+    // Expected values are CPython 3.12 sum(values)
+    #[test]
+    fn float_sum_compensates_like_python() {
+        assert_eq!(float_sum([0.1; 10]), Some(1.0));
+        assert_eq!(float_sum([1e100, 1.0, -1e100]), Some(1.0));
+        assert_eq!(float_sum([]), None);
+    }
 
     // Expected values are CPython 3.14 int(text)
     #[rstest]
