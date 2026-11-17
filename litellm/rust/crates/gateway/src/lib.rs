@@ -1,9 +1,11 @@
 mod db;
 mod error;
 mod health;
+mod license;
 mod redis;
 mod state;
 pub use error::Error;
+pub use license::build_license;
 pub use redis::RedisClients;
 pub use state::AppState;
 
