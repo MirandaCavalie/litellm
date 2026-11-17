@@ -33,7 +33,7 @@ The Python gateway and the Rust gateway both host this crate during the migratio
 
 # Parity with the Python Prisma stack
 
-Python and SQLx run side by side until every repository operation is native, so the SQLx pool must honor every database setting Python honors. `Endpoint` is resolved in Python from the final `DATABASE_URL` (`litellm/proxy/db/native_database.py`); Rust never reads `DATABASE_*` env vars or parses a Prisma URL. When `litellm/proxy/db/` gains a setting or behavior, add it here
+Python and SQLx run side by side until every repository operation is native, so the SQLx pool must honor every database setting Python honors. The Python host resolves `Endpoint` from the final `DATABASE_URL` (`litellm/proxy/db/native_database.py`) and the Rust gateway resolves it with `db-resolve`. This crate never reads `DATABASE_*` env vars or parses a URL. When `litellm/proxy/db/` gains a setting or behavior, add it here
 
 | Python behavior | Where | Native status |
 | --- | --- | --- |
