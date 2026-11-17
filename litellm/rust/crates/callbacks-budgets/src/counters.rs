@@ -1,9 +1,10 @@
-//! The post-call spend counter fan-out: which `spend:*` counters one charged request bumps.
+//! The post-call spend counter fan-out's decisions: which `spend:*` counters one charged request
+//! bumps.
 //!
 //! The functions here are pure. They pick every counter key for a charge, skip the ones a budget
 //! reservation already holds, name the auth cache entries a cold counter falls back to, and say
-//! which scopes may warm their counters concurrently. The proxy runs the plan's warm checks,
-//! seeds and the single `INCRBYFLOAT` pipeline through its spend counter store.
+//! which scopes may warm their counters concurrently. [`crate::charge`] runs the plan against the
+//! spend counter store.
 
 use std::collections::HashSet;
 
@@ -44,7 +45,10 @@ pub struct Charge {
 pub struct CustomerWindow {
     pub counter_key: String,
     pub entity_type: String,
+    pub entity_id: String,
     pub window_duration: Option<String>,
+    /// The start of the window the request falls in, ISO 8601; `None` when it is not valid.
+    pub window_start: Option<String>,
 }
 
 /// An entity whose budget windows live on its cached auth object. The strum string is the entity
@@ -138,14 +142,6 @@ pub fn has_committed_twin(counter_key: &str) -> bool {
         && !counter_key.contains(":window:")
 }
 
-/// The committed twin's key, `spend:committed:` followed by the counter's key past `spend:`.
-pub fn committed_twin(counter_key: &str) -> String {
-    format!(
-        "spend:committed:{}",
-        counter_key.strip_prefix("spend:").unwrap_or(counter_key)
-    )
-}
-
 /// The tracked counters whose committed twin takes this charge, none unless the cost is positive.
 pub fn committed_counter_keys(tracked: &[String], response_cost: Option<f64>) -> Vec<String> {
     match response_cost {
@@ -166,64 +162,6 @@ fn named(values: Option<&[Option<String>]>) -> Vec<String> {
         .flatten()
         .filter(|name| !name.is_empty() && seen.insert(name.as_str()))
         .cloned()
-        .collect()
-}
-
-/// Every counter the fan-out warms, bound to the batch read before the database write so the
-/// warm checks share one `MGET`. Budget windows bind when they are read.
-pub fn post_call_counter_keys(charge: &Charge) -> Vec<String> {
-    let entity = [
-        charge
-            .token
-            .as_deref()
-            .map(|token| format!("spend:key:{token}")),
-        charge
-            .team_id
-            .as_deref()
-            .map(|team| format!("spend:team:{team}")),
-        charge
-            .team_id
-            .as_deref()
-            .zip(charge.user_id.as_deref())
-            .map(|(team, user)| format!("spend:team_member:{user}:{team}")),
-        charge
-            .user_id
-            .as_deref()
-            .map(|user| format!("spend:user:{user}")),
-        charge
-            .end_user_id
-            .as_deref()
-            .map(|end_user| format!("spend:end_user:{end_user}")),
-        charge
-            .org_id
-            .as_deref()
-            .map(|org| format!("spend:org:{org}")),
-        charge
-            .project_id
-            .as_deref()
-            .map(|project| format!("spend:project:{project}")),
-    ];
-    let mut seen = HashSet::new();
-    entity
-        .into_iter()
-        .flatten()
-        .chain(
-            named(charge.tags.as_deref())
-                .into_iter()
-                .map(|tag| format!("spend:tag:{tag}")),
-        )
-        .chain(
-            named(charge.model_access_groups.as_deref())
-                .into_iter()
-                .map(|group| format!("spend:model_access_group:{group}")),
-        )
-        .chain(
-            charge
-                .customer_windows
-                .iter()
-                .map(|w| w.counter_key.clone()),
-        )
-        .filter(|key| seen.insert(key.clone()))
         .collect()
 }
 
@@ -492,11 +430,13 @@ mod tests {
                     counter_key: "spend:customer_org:c:window:1mo@x".into(),
                     entity_type: "customer_org".into(),
                     window_duration: Some("1mo".into()),
+                    ..CustomerWindow::default()
                 },
                 CustomerWindow {
                     counter_key: "spend:customer_org:c:lifetime".into(),
                     entity_type: "customer_org".into(),
                     window_duration: None,
+                    ..CustomerWindow::default()
                 },
             ],
             ..Charge::default()
@@ -654,14 +594,6 @@ mod tests {
         assert_eq!(committed_counter_keys(&tracked, cost), expected);
     }
 
-    #[test]
-    fn committed_twin_replaces_the_spend_prefix() {
-        assert_eq!(
-            committed_twin("spend:end_user:e"),
-            "spend:committed:end_user:e"
-        );
-    }
-
     #[rstest]
     #[case::none(None, None)]
     #[case::zero(Some(0.0), None)]
@@ -697,29 +629,6 @@ mod tests {
         assert_eq!(counters[0].entity_label, label);
         assert!(!counters[1].reserved);
         assert!(counters[1].counter_key.ends_with("7d"));
-    }
-
-    #[test]
-    fn post_call_counter_keys_cover_every_warm_checked_counter() {
-        let mut keys = post_call_counter_keys(&full_charge());
-        keys.sort();
-        assert_eq!(
-            keys,
-            vec![
-                "spend:customer_org:c:lifetime",
-                "spend:customer_org:c:window:1mo@x",
-                "spend:end_user:eu1",
-                "spend:key:hashed",
-                "spend:model_access_group:g",
-                "spend:org:o1",
-                "spend:project:p1",
-                "spend:tag:a",
-                "spend:tag:b",
-                "spend:team:t1",
-                "spend:team_member:u1:t1",
-                "spend:user:u1",
-            ]
-        );
     }
 
     #[test]

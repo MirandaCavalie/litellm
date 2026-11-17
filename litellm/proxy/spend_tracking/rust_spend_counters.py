@@ -1,97 +1,168 @@
+"""The ledger's post-call spend counter step, run in Rust by ``NativeBudgets.charge_counters``.
+
+Rust settles the customer hierarchy, reconciles the reservation, warms and seeds every counter, sends the increments
+in one pipeline and stamps the reservation. The host here answers only what the proxy alone knows, a whole batch per
+call: budget windows from the auth cache or their stored row, stored spend from the database, and the auth cache's
+spend for a counter the database cannot answer.
+"""
+
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+import asyncio
+from collections.abc import Iterable, Mapping, Sequence
+from datetime import datetime
 from typing import TYPE_CHECKING, Annotated, Final, Literal, TypeAlias
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
-from litellm.rust_bridge._native import (
-    budget_window_counters,
-    committed_spend_counter_keys,
-    customer_spend_settlement,
-    spend_counter_keys,
-    spend_counter_plan,
-)
+from litellm.caching.redis_batch import PostCallSettlement, active_request_redis_batches
+from litellm.proxy.auth.customer_spend import customer_spend_counter
+from litellm.proxy.db.spend_counter_reseed import SpendCounterReseed
+from litellm.redis.stores._route import post_call_request
+from litellm.redis.stores.spend_counters import END_USER_COUNTER_PREFIX
+from litellm.rust_bridge.execution import Execution, drive
+from litellm.types.integrations.slack_alerting import Litellm_EntityType
+from litellm.types.proxy.auth.customer_hierarchy import CustomerHierarchyAuth
+from litellm.types.proxy.carried_budget_state import EntitySpendCounterKeys
 
 if TYPE_CHECKING:
     from litellm.proxy.spend_tracking.budget_reservation import BudgetCounter
 
-WindowedEntity: TypeAlias = Literal["key", "team", "user"]
+
+class _Request(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
 
-class CounterTask(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
-    task: Literal["counter"]
-    counter_key: str
-    source_cache_keys: tuple[str, ...]
-
-    @property
-    def source_cache_key(self) -> str | tuple[str, ...]:
-        return self.source_cache_keys[0] if len(self.source_cache_keys) == 1 else self.source_cache_keys
-
-
-class CachedWindowsTask(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
-    task: Literal["cached_windows"]
-    entity_type: WindowedEntity
+class _WindowSource(_Request):
+    entity_type: Literal["key", "team", "user"]
     entity_id: str
     cache_key: str
 
 
-class CustomerWindowTask(BaseModel):
-    model_config = ConfigDict(frozen=True)
+class _BudgetWindows(_Request):
+    entities: tuple[_WindowSource, ...]
+    stored: bool
 
-    task: Literal["customer_window"]
-    index: int
+
+class _EntitySpend(_Request):
+    source: Literal["entity"]
     counter_key: str
-    entity_label: str
-    reserved: bool
 
 
-class CommittedTask(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
-    task: Literal["committed"]
-    counter_keys: tuple[str, ...]
-
-
-SpendCounterTask: TypeAlias = Annotated[
-    CounterTask | CachedWindowsTask | CustomerWindowTask | CommittedTask, Field(discriminator="task")
-]
+class _WindowSpend(_Request):
+    source: Literal["window"]
+    entity_type: str
+    entity_id: str
+    window_duration: str | None
+    window_start: datetime
 
 
-class SpendCounterScope(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
-    concurrent: bool
-    tasks: tuple[SpendCounterTask, ...]
+class _StoredSpend(_Request):
+    counters: tuple[Annotated[_EntitySpend | _WindowSpend, Field(discriminator="source")], ...]
 
 
-class SpendCounterPlan(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
-    scopes: tuple[SpendCounterScope, ...]
+class _CachedSpend(_Request):
+    sources: tuple[tuple[str, ...], ...]
 
 
-class WindowCounter(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
-    counter_key: str
-    entity_label: str
-    reserved: bool
+_BudgetWindow: TypeAlias = tuple[str, str | None]
+_LIMITS: Final = TypeAdapter(tuple[object, ...])
+_FIELDS: Final = TypeAdapter(Mapping[str, object])
+_ANY_VALUE: Final = TypeAdapter(object)
 
 
-class CustomerSettlement(BaseModel):
-    model_config = ConfigDict(frozen=True)
+def _window_field(window: object, name: str) -> object:
+    try:
+        return _FIELDS.validate_python(window).get(name)
+    except ValidationError:
+        return getattr(window, name, None)
 
-    seeds: tuple[tuple[str, float], ...]
-    increments: tuple[tuple[str, float], ...]
+
+def _budget_window(window: object) -> _BudgetWindow | None:
+    """The window's duration and the start of the window this request falls in, as the proxy computes it."""
+    from litellm.proxy.spend_tracking.budget_reservation import get_budget_window_start
+
+    duration: Final = _window_field(window, "budget_duration")
+    if not isinstance(duration, str):
+        return None
+    start: Final = get_budget_window_start(window)
+    return duration, None if start is None else start.isoformat()
 
 
-_KEYS: Final = TypeAdapter(tuple[str, ...])
-_WINDOW_COUNTERS: Final = TypeAdapter(tuple[WindowCounter, ...])
+def _budget_windows(budget_limits: object) -> tuple[_BudgetWindow, ...]:
+    if not isinstance(budget_limits, (list, tuple)):
+        return ()
+    return tuple(window for window in map(_budget_window, _LIMITS.validate_python(budget_limits)) if window is not None)
+
+
+async def _stored_spend(counter: _EntitySpend | _WindowSpend) -> float | None:
+    from litellm.proxy.proxy_server import prisma_client
+
+    match counter:
+        case _EntitySpend(counter_key=counter_key) if counter_key.startswith(END_USER_COUNTER_PREFIX):
+            return await SpendCounterReseed.end_user_from_db(prisma_client=prisma_client, counter_key=counter_key)
+        case _EntitySpend(counter_key=counter_key):
+            return await SpendCounterReseed.from_db(prisma_client=prisma_client, counter_key=counter_key)
+        case _WindowSpend():
+            return await SpendCounterReseed.window_from_db(
+                prisma_client=prisma_client,
+                entity_type=counter.entity_type,
+                entity_id=counter.entity_id,
+                window_duration=counter.window_duration,
+                window_start=counter.window_start,
+            )
+
+
+class _CounterHost:
+    """The proxy's half of the counter step: the auth cache and the database, which only the proxy holds."""
+
+    async def budget_windows(self, request: object) -> tuple[tuple[_BudgetWindow, ...] | None, ...]:
+        from litellm.proxy.proxy_server import (
+            _cached_budget_limits,  # pyright: ignore[reportPrivateUsage]  # the proxy's cached budget-limit reader
+            _stored_budget_limits,  # pyright: ignore[reportPrivateUsage]  # the proxy's stored budget-limit reader
+            user_api_key_cache,
+        )
+
+        windows: Final = _BudgetWindows.model_validate(request)
+
+        async def of(source: _WindowSource) -> tuple[_BudgetWindow, ...] | None:
+            if windows.stored:
+                return _budget_windows(
+                    await _stored_budget_limits(Litellm_EntityType(source.entity_type), source.entity_id)
+                )
+            cached: Final = _ANY_VALUE.validate_python(await user_api_key_cache.async_get_cache(key=source.cache_key))
+            return None if cached is None else _budget_windows(_cached_budget_limits(cached))
+
+        return tuple(await asyncio.gather(*map(of, windows.entities)))
+
+    async def stored_spend(self, request: object) -> tuple[float | None, ...]:
+        return tuple(await asyncio.gather(*map(_stored_spend, _StoredSpend.model_validate(request).counters)))
+
+    async def cached_spend(self, request: object) -> tuple[float, ...]:
+        from litellm.proxy.proxy_server import (
+            _get_source_cache_base_spend,  # pyright: ignore[reportPrivateUsage]  # the proxy's source-cache spend reader
+        )
+
+        return tuple(
+            await asyncio.gather(
+                *(
+                    _get_source_cache_base_spend(source_cache_key=list(sources))
+                    for sources in _CachedSpend.model_validate(request).sources
+                )
+            )
+        )
+
+    def track_post_call_settlement(self, settlement: PostCallSettlement) -> None:
+        batches: Final = active_request_redis_batches()
+        if batches is not None:
+            batches.track_post_call_settlement(settlement)
+
+
+_HOST: Final = _CounterHost()
+
+
+def _streamless(execution: Execution, head: object) -> object:
+    raise RuntimeError("the spend counter step cannot open a stream")
 
 
 def _text(value: object) -> str | None:
@@ -102,18 +173,47 @@ def _names(values: Iterable[object] | None) -> tuple[str | None, ...] | None:
     return None if values is None else tuple(_text(value) for value in values)
 
 
-def _charge(
-    token: object,
-    team_id: object,
-    user_id: object,
-    org_id: object,
-    end_user_id: object,
-    project_id: object,
-    tags: Iterable[object] | None,
-    model_access_groups: Iterable[object] | None,
+def _customer_scopes(customer_hierarchy: object) -> tuple[Mapping[str, object], ...]:
+    if customer_hierarchy is None:
+        return ()
+    try:
+        hierarchy: Final = CustomerHierarchyAuth.model_validate(customer_hierarchy)
+    except ValidationError:
+        return ()
+    return tuple({"counter_key": customer_spend_counter(scope), "spend": scope.spend} for scope in hierarchy.scopes)
+
+
+def runs_on_rust_store() -> bool:
+    """Whether the proxy's installed spend counter store is the Rust one the counter step runs on."""
+    from litellm.proxy.spend_tracking.native_budgets import native_budgets
+
+    return native_budgets() is not None
+
+
+async def charge_spend_counters(
+    token: str | None,
+    team_id: str | None,
+    user_id: str | None,
+    response_cost: float | None,
+    org_id: str | None,
+    budget_reservation: dict[str, object] | None,  # mutable-ok: the step stamps the caller's shared reservation
+    end_user_id: str | None,
+    tags: Sequence[object] | None,
+    model_access_groups: Sequence[object] | None,
+    project_id: str | None,
+    committed_spend_scope: EntitySpendCounterKeys | None,
     customer_counters: Sequence[BudgetCounter],
-) -> dict[str, object]:  # mutable-ok: handed straight to the native call as its keyword record
-    return {
+    customer_hierarchy: object,
+) -> None:
+    """The ledger's whole post-call counter step for one charge, run by the Rust engine on the proxy's store."""
+    from litellm.proxy.proxy_server import spend_counter_store
+    from litellm.proxy.spend_tracking.native_budgets import native_budgets, reservation_inputs
+
+    budgets: Final = native_budgets()
+    if budgets is None:
+        raise RuntimeError("the ledger's spend counter step runs on the Rust spend counter store")
+    record, window_resets = reservation_inputs(budget_reservation)
+    step: Final[Mapping[str, object]] = {
         "token": _text(token),
         "team_id": _text(team_id),
         "user_id": _text(user_id),
@@ -122,98 +222,28 @@ def _charge(
         "project_id": _text(project_id),
         "tags": _names(tags),
         "model_access_groups": _names(model_access_groups),
-        "customer_windows": [
+        "response_cost": response_cost,
+        "committed_tracked": () if committed_spend_scope is None else tuple(committed_spend_scope.tracked()),
+        "customer_windows": tuple(
             {
                 "counter_key": counter.counter_key,
                 "entity_type": counter.entity_type,
+                "entity_id": counter.entity_id,
                 "window_duration": counter.window_duration,
+                "window_start": None if counter.window_start is None else counter.window_start.isoformat(),
             }
             for counter in customer_counters
-        ],
+        ),
+        "customer_scopes": _customer_scopes(customer_hierarchy),
+        "window_resets": window_resets,
     }
-
-
-def post_call_counter_keys(
-    token: object,
-    team_id: object,
-    user_id: object,
-    org_id: object,
-    end_user_id: object,
-    tags: Iterable[object] | None,
-    model_access_groups: Iterable[object] | None,
-    project_id: object = None,
-    customer_counters: Sequence[BudgetCounter] = (),
-) -> frozenset[str]:
-    return frozenset(
-        _KEYS.validate_python(
-            spend_counter_keys(
-                _charge(
-                    token,
-                    team_id,
-                    user_id,
-                    org_id,
-                    end_user_id,
-                    project_id,
-                    tags,
-                    model_access_groups,
-                    customer_counters,
-                )
-            )
-        )
-    )
-
-
-def plan_spend_counters(
-    token: str | None,
-    team_id: str | None,
-    user_id: str | None,
-    org_id: str | None,
-    end_user_id: str | None,
-    project_id: str | None,
-    tags: Iterable[object] | None,
-    model_access_groups: Iterable[object] | None,
-    reserved_counter_keys: Iterable[str],
-    committed_counter_keys: Sequence[str],
-    customer_counters: Sequence[BudgetCounter],
-) -> SpendCounterPlan:
-    return SpendCounterPlan.model_validate(
-        spend_counter_plan(
-            {
-                **_charge(
-                    token,
-                    team_id,
-                    user_id,
-                    org_id,
-                    end_user_id,
-                    project_id,
-                    tags,
-                    model_access_groups,
-                    customer_counters,
-                ),
-                "reserved_counter_keys": list(reserved_counter_keys),
-                "committed_counter_keys": list(committed_counter_keys),
-            }
-        )
-    )
-
-
-def committed_counter_keys(tracked: Iterable[str], response_cost: float | None) -> tuple[str, ...]:
-    return tuple(committed_spend_counter_keys(list(tracked), response_cost))
-
-
-def window_counter(
-    entity_type: WindowedEntity, entity_id: str, duration: str, reserved_counter_keys: Iterable[str]
-) -> WindowCounter:
-    return _WINDOW_COUNTERS.validate_python(
-        budget_window_counters(entity_type, entity_id, [duration], list(reserved_counter_keys))
-    )[0]
-
-
-def customer_settlement(
-    scopes: Sequence[tuple[str, float]], readings: Sequence[float | None], cost: float
-) -> CustomerSettlement:
-    return CustomerSettlement.model_validate(
-        customer_spend_settlement(
-            [{"counter_key": counter_key, "spend": spend} for counter_key, spend in scopes], list(readings), cost
-        )
+    _ = await drive(
+        budgets.charge_counters(
+            step,
+            record,
+            budget_reservation,
+            post_call_request() if spend_counter_store.has_redis else None,
+            _HOST,
+        ),
+        _streamless,
     )
