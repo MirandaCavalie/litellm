@@ -2,7 +2,12 @@ from typing import Final
 
 import pytest
 
-from litellm.proxy.db.connection_budget import ConnectionBudget
+from litellm.proxy.db.connection_budget import (
+    RUST_RESERVED_CONNECTIONS,
+    SPEND_LOGS_LEDGER_RESERVED_CONNECTIONS,
+    ConnectionBudget,
+    rust_reserved_connections,
+)
 
 
 @pytest.mark.parametrize("total", range(1, 41))
@@ -24,6 +29,27 @@ def test_prisma_keeps_one_connection_when_the_reserve_does_not_fit(total: int, p
     budget: Final = ConnectionBudget.split(total, rust_reserved=2)
 
     assert (budget.python, budget.rust) == (python, 2)
+
+
+def test_the_ledger_reserves_two_more_rust_connections_than_the_base() -> None:
+    assert SPEND_LOGS_LEDGER_RESERVED_CONNECTIONS == 2
+    assert rust_reserved_connections(True, {}) == RUST_RESERVED_CONNECTIONS + 2
+
+
+def test_without_the_ledger_the_base_reserve_stands() -> None:
+    assert rust_reserved_connections(False, {}) == RUST_RESERVED_CONNECTIONS
+
+
+@pytest.mark.parametrize("ledger_enabled", [True, False], ids=["ledger_on", "ledger_off"])
+@pytest.mark.parametrize("explicit", ["0", "5", "12"])
+def test_an_explicit_env_value_overrides_the_default(ledger_enabled: bool, explicit: str) -> None:
+    assert rust_reserved_connections(ledger_enabled, {"RUST_RESERVED_CONNECTIONS": explicit}) == int(explicit)
+
+
+@pytest.mark.parametrize("explicit", ["", "-1", "2.0", "abc", " 2", "\u00b2"])
+def test_an_env_value_that_is_not_a_non_negative_integer_is_refused(explicit: str) -> None:
+    with pytest.raises(ValueError, match="RUST_RESERVED_CONNECTIONS must be a non-negative integer"):
+        rust_reserved_connections(True, {"RUST_RESERVED_CONNECTIONS": explicit})
 
 
 @pytest.mark.parametrize("connection_limit", ["7", 7])

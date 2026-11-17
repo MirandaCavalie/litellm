@@ -681,7 +681,7 @@ from litellm.proxy.config_resolvers.settings_rules import (
 from litellm.proxy.config_resolvers.sso import SSO_FIELD_ENV_VARS
 from litellm.proxy.container_endpoints.endpoints import router as container_router
 from litellm.proxy.credential_endpoints.endpoints import router as credential_router
-from litellm.proxy.db.connection_budget import RUST_RESERVED_CONNECTIONS
+from litellm.proxy.db.connection_budget import rust_reserved_connections
 from litellm.proxy.db.create_views import SupportsRawQueries
 from litellm.proxy.db.db_transaction_queue.pod_lock_manager import PodLockManager
 from litellm.proxy.db.db_transaction_queue.spend_log_cleanup import (
@@ -1044,7 +1044,10 @@ from litellm.proxy.spend_tracking.spend_counter_batch import (
     record_spend_counter_value,
     spend_counter_batch_scope,
 )
-from litellm.proxy.spend_tracking.spend_logs_ledger_setting import capture_spend_logs_ledger_setting
+from litellm.proxy.spend_tracking.spend_logs_ledger_setting import (
+    capture_spend_logs_ledger_setting,
+    spend_logs_ledger_enabled,
+)
 from litellm.proxy.spend_tracking.spend_management_endpoints import (
     router as spend_management_router,
 )
@@ -1635,7 +1638,7 @@ async def _own_database(resources: AsyncExitStack, client: PrismaClient | None) 
         client,
         os.environ["DATABASE_URL"],
         os.environ.get("DATABASE_URL_READ_REPLICA") or None,
-        RUST_RESERVED_CONNECTIONS,
+        rust_reserved_connections(spend_logs_ledger_enabled(general_settings_view()), os.environ),
     )
     resources.push_async_callback(database.aclose)
     return database

@@ -5,6 +5,7 @@ database."""
 import asyncio
 import uuid
 from collections.abc import AsyncIterator, Mapping, Sequence
+from contextlib import AsyncExitStack
 from datetime import datetime, timezone
 from typing import Final
 
@@ -14,12 +15,19 @@ import pytest_asyncio
 from psycopg.rows import dict_row
 from pydantic import JsonValue, TypeAdapter
 
+import litellm
 import litellm.proxy.proxy_server as ps
 from litellm.integrations.custom_logger_v2.rust import RustLogger
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.db.native_database import ServiceLoggingEvents, native_endpoint
-from litellm.proxy.db.rust_spend_log_writer import install_rust_spend_log_writer, uninstall_rust_spend_log_writer
-from litellm.proxy.hooks.rust_spend_logger import spend_logger
+from litellm.proxy.db.rust_spend_log_writer import (
+    install_rust_spend_log_writer,
+    rust_spend_log_writer,
+    uninstall_rust_spend_log_writer,
+)
+from litellm.proxy.hooks.proxy_track_cost_callback import ProxyDBLogger
+from litellm.proxy.hooks.rust_spend_logger import SpendLogHost, spend_logger
+from litellm.proxy.spend_tracking.spend_logs_ledger_setting import capture_spend_logs_ledger_setting
 from litellm.proxy.utils import PrismaClient, ProxyUpdateSpend
 from litellm.rust_bridge._native import NativeDatabase, NativeSpendCounters, RustSpendLogWriter
 from tests.integration.database.test_rust_spend_log_writer_parity import FakePrismaClient, _database_url, _proxy_logging
@@ -177,3 +185,42 @@ async def test_a_failed_request_lands_the_same_failure_rows(ledger: Ledger) -> N
     assert rust_logs[0]["status"] == "failure"
     assert _masked(rust_logs, _FAILURE_LOG_VOLATILE) == _masked(python_logs, _FAILURE_LOG_VOLATILE)
     assert _masked(rust_deliveries, _DELIVERY_VOLATILE) == _masked(python_deliveries, _DELIVERY_VOLATILE)
+
+
+class _ClosableFakePrismaClient(FakePrismaClient):
+    async def aclose(self) -> None:
+        return None
+
+
+async def test_default_startup_opens_the_rust_pool_and_registers_the_rust_spend_logger(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    url: Final = _database_url()
+    for name in ("RUST_RESERVED_CONNECTIONS", "SPEND_LOGS_URL", "DATABASE_URL_READ_REPLICA"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("DATABASE_URL", url)
+    monkeypatch.setattr(ps, "general_settings", {})
+    monkeypatch.setattr(litellm, "callbacks", [])
+    monkeypatch.setattr(litellm, "_async_success_callback", [])
+    forget: Final = capture_spend_logs_ledger_setting({})
+    client: Final = _ClosableFakePrismaClient(url)
+    try:
+        async with AsyncExitStack() as resources:
+            database: Final = await ps._own_database(resources, client)  # pyright: ignore[reportArgumentType]  # the fake stands in for the Prisma client
+            assert database is not None
+            assert database.native is not None
+            await ps._install_rust_spend_log_writer(resources, database)
+            assert rust_spend_log_writer(client) is not None
+            monkeypatch.setattr(ps, "prisma_client", client)
+            ps.cost_tracking()
+            spend_loggers: Final = [
+                callback
+                for callback in litellm.callbacks
+                if isinstance(callback, RustLogger) and isinstance(callback.host, SpendLogHost)
+            ]
+            assert len(spend_loggers) == 1
+            assert spend_loggers[0] in litellm._async_success_callback
+            assert not any(isinstance(callback, ProxyDBLogger) for callback in litellm.callbacks)
+        assert rust_spend_log_writer(client) is None
+    finally:
+        forget()

@@ -997,6 +997,7 @@ class TestProxyInitializationHelpers:
                 "general_settings": {
                     "database_url": "postgresql://test:test@localhost:5432/test",
                     "database_connection_pool_limit": 5,
+                    "use_spend_logs_ledger": False,
                     **timeout_config,
                 }
             }
@@ -2373,7 +2374,9 @@ class TestQueryEngineReaperWiring:
         from litellm.proxy.proxy_cli import run_server
 
         runner = CliRunner()
-        clean_env: Final = {k: v for k, v in os.environ.items() if k not in ("DATABASE_URL", "DIRECT_URL", "NUM_WORKERS")}
+        clean_env: Final = {
+            k: v for k, v in os.environ.items() if k not in ("DATABASE_URL", "DIRECT_URL", "NUM_WORKERS")
+        }
         if env:
             clean_env.update(env)
         with (
@@ -3563,7 +3566,9 @@ def test_prisma_keeps_the_whole_connection_limit_and_its_name(
     expected_name: str | None,
 ) -> None:
     config_path: Final = tmp_path / "config.yaml"
-    config_path.write_text(yaml.dump({"model_list": [], "general_settings": general_settings}))
+    config_path.write_text(
+        yaml.dump({"model_list": [], "general_settings": {**general_settings, "use_spend_logs_ledger": False}})
+    )
 
     captured: Final = _CAPTURED_URLS.validate_python(
         _run_server_and_capture_urls(
@@ -3578,6 +3583,68 @@ def test_prisma_keeps_the_whole_connection_limit_and_its_name(
         None if expected_name is None else [expected_name],
     )
     assert direct["connection_limit"] == [expected_limit]
+
+
+@pytest.mark.parametrize(
+    "general_settings, reserved_env, expected_writer, expected_reader, expected_line",
+    [
+        pytest.param(
+            {},
+            None,
+            "8",
+            "48",
+            "1 worker(s) x (writer connection_limit 8 + rust writer pool 2 + reader connection_limit 48"
+            " + rust reader pool 2) = up to 60 connections",
+            id="ledger_on_by_default",
+        ),
+        pytest.param(
+            {"database_connection_pool_limit": 30, "use_spend_logs_ledger": True},
+            None,
+            "28",
+            "48",
+            "1 worker(s) x (writer connection_limit 28 + rust writer pool 2 + reader connection_limit 48"
+            " + rust reader pool 2) = up to 80 connections",
+            id="ledger_on_with_a_configured_limit",
+        ),
+        pytest.param(
+            {},
+            "0",
+            "10",
+            "50",
+            "1 worker(s) x (writer connection_limit 10 + reader connection_limit 50) = up to 60 connections",
+            id="explicit_env_overrides_the_ledger_reserve",
+        ),
+    ],
+)
+def test_the_ledger_carves_the_rust_writer_pool_out_of_each_limit(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    general_settings: dict[str, object],
+    reserved_env: str | None,
+    expected_writer: str,
+    expected_reader: str,
+    expected_line: str,
+) -> None:
+    if reserved_env is not None:
+        monkeypatch.setenv("RUST_RESERVED_CONNECTIONS", reserved_env)
+    config_path: Final = tmp_path / "config.yaml"
+    config_path.write_text(yaml.dump({"model_list": [], "general_settings": general_settings}))
+
+    captured: Final = _CAPTURED_URLS.validate_python(
+        _run_server_and_capture_urls(
+            str(config_path),
+            direct_url="postgresql://t:t@localhost:5432/t",
+            read_replica_url="postgresql://t:t@reader:5432/t?connection_limit=50",
+        )
+    )
+
+    def limit(name: str) -> list[str]:
+        return urlparse.parse_qs(urlparse.urlparse(captured[name]).query)["connection_limit"]
+
+    assert (limit("DATABASE_URL"), limit("DATABASE_URL_READ_REPLICA")) == ([expected_writer], [expected_reader])
+    assert limit("DIRECT_URL") == ["30" if "database_connection_pool_limit" in general_settings else "10"]
+    assert expected_line in capsys.readouterr().out
 
 
 class TestReadReplicaConnectionParams:
@@ -3602,6 +3669,7 @@ class TestReadReplicaConnectionParams:
                         "database_socket_timeout": 120,
                         "database_disable_prepared_statements": True,
                         "database_statement_timeout": 60,
+                        "use_spend_logs_ledger": False,
                     },
                 }
             )
@@ -3635,6 +3703,7 @@ class TestReadReplicaConnectionParams:
                     "general_settings": {
                         "database_connection_pool_limit": 3,
                         "database_connection_pool_timeout": 20,
+                        "use_spend_logs_ledger": False,
                     },
                 }
             )
@@ -3674,7 +3743,14 @@ class TestReadReplicaConnectionParams:
         import yaml
 
         config_path: Final = tmp_path / "config.yaml"
-        config_path.write_text(yaml.dump({"model_list": [], "general_settings": {"database_connection_pool_limit": 3}}))
+        config_path.write_text(
+            yaml.dump(
+                {
+                    "model_list": [],
+                    "general_settings": {"database_connection_pool_limit": 3, "use_spend_logs_ledger": False},
+                }
+            )
+        )
 
         _run_server_and_capture_urls(
             str(config_path),
@@ -3694,7 +3770,14 @@ class TestReadReplicaConnectionParams:
         import yaml
 
         config_path: Final = tmp_path / "config.yaml"
-        config_path.write_text(yaml.dump({"model_list": [], "general_settings": {"database_connection_pool_limit": 3}}))
+        config_path.write_text(
+            yaml.dump(
+                {
+                    "model_list": [],
+                    "general_settings": {"database_connection_pool_limit": 3, "use_spend_logs_ledger": False},
+                }
+            )
+        )
 
         _run_server_and_capture_urls(
             str(config_path),
@@ -3715,6 +3798,7 @@ class TestReadReplicaConnectionParams:
                     "model_list": [],
                     "general_settings": {
                         "database_connection_pool_limit": 3,
+                        "use_spend_logs_ledger": False,
                         "database_extra_connection_params": {
                             "options": "-c search_path=writer_schema",
                             "schema": "writer_schema",
@@ -4810,7 +4894,9 @@ def test_control_plane_rejects_a_lone_tls_file() -> None:
     assert result.exit_code == 2 and "both" in result.output
 
 
-def test_control_plane_migration_job_needs_only_its_own_database_and_never_starts_prisma_or_server(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_control_plane_migration_job_needs_only_its_own_database_and_never_starts_prisma_or_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from litellm.proxy.control_plane.store.migrate import migrate_from_environment
 
     monkeypatch.setenv("CONTROL_PLANE_DATABASE_URL", "postgresql://dedicated/control")

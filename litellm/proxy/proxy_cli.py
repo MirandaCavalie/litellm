@@ -270,6 +270,7 @@ WORKER_APP: Final = "litellm_cli.main:proxy_worker_app"
 WORKER_LOG_CONFIG_ENV: Final = "LITELLM_WORKER_LOG_CONFIG"
 _LOG_CONFIG: Final = TypeAdapter[str | Mapping[str, object]](str | Mapping[str, object])
 _LOG_CONFIG_FILE: Final = TypeAdapter[Mapping[str, object]](Mapping[str, object])
+_GENERAL_SETTINGS: Final = TypeAdapter[Mapping[str, object]](Mapping[str, object])
 _DECODED_JSON: Final = TypeAdapter[object](object)
 
 
@@ -1723,7 +1724,11 @@ def run_server(
             db_connection_timeout = LiteLLMDatabaseConnectionPool.database_connection_pool_timeout.value
 
         if os.getenv("DATABASE_URL", None) is not None or os.getenv("DIRECT_URL", None) is not None:
-            from litellm.proxy.db.connection_budget import ConnectionBudget
+            from litellm.proxy.db.connection_budget import (
+                RUST_RESERVED_CONNECTIONS_ENV_VAR,
+                ConnectionBudget,
+                rust_reserved_connections,
+            )
             from litellm.proxy.db.db_url_settings import (
                 DISABLE_PREPARED_STATEMENTS_ENV_VAR,
                 add_missing_query_params,
@@ -1735,6 +1740,7 @@ def run_server(
                 unsupported_db_scheme,
                 unsupported_db_scheme_message,
             )
+            from litellm.proxy.spend_tracking.spend_logs_ledger_setting import spend_logs_ledger_enabled
 
             for _db_env in ("DATABASE_URL", "DIRECT_URL"):
                 _candidate_url = os.getenv(_db_env)
@@ -1764,7 +1770,11 @@ def run_server(
                 disable_prepared_statements=disable_prepared_statements,
                 extra_params=db_extra_connection_params,
             )
-            writer_budget: Final = ConnectionBudget.of(connection_url_params["connection_limit"])
+            rust_reserved: Final = rust_reserved_connections(
+                spend_logs_ledger_enabled(_GENERAL_SETTINGS.validate_python(general_settings)), os.environ
+            )
+            os.environ[RUST_RESERVED_CONNECTIONS_ENV_VAR] = str(rust_reserved)
+            writer_budget: Final = ConnectionBudget.of(connection_url_params["connection_limit"], rust_reserved)
             rust_writer_connections: Final = 0 if writer_budget is None else writer_budget.rust
             prisma_url_params: Final = (
                 connection_url_params if writer_budget is None else writer_budget.prisma_params(connection_url_params)
@@ -1806,7 +1816,8 @@ def run_server(
             read_replica_url: Final[str | None] = os.getenv("DATABASE_URL_READ_REPLICA")
             reader_budget: Final = (
                 ConnectionBudget.of(
-                    _url_query_value(read_replica_url, "connection_limit") or connection_url_params["connection_limit"]
+                    _url_query_value(read_replica_url, "connection_limit") or connection_url_params["connection_limit"],
+                    rust_reserved,
                 )
                 if read_replica_url
                 else None

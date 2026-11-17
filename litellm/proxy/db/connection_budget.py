@@ -23,6 +23,18 @@ from typing import Final
 
 RUST_RESERVED_CONNECTIONS: Final = 0
 
+SPEND_LOGS_LEDGER_RESERVED_CONNECTIONS: Final = 2
+RUST_RESERVED_CONNECTIONS_ENV_VAR: Final = "RUST_RESERVED_CONNECTIONS"
+
+
+def rust_reserved_connections(ledger_enabled: bool, environ: Mapping[str, str]) -> int:
+    explicit: Final = environ.get(RUST_RESERVED_CONNECTIONS_ENV_VAR)
+    if explicit is not None:
+        if not (explicit.isascii() and explicit.isdigit()):
+            raise ValueError(f"{RUST_RESERVED_CONNECTIONS_ENV_VAR} must be a non-negative integer, got {explicit!r}")
+        return int(explicit)
+    return RUST_RESERVED_CONNECTIONS + (SPEND_LOGS_LEDGER_RESERVED_CONNECTIONS if ledger_enabled else 0)
+
 
 @dataclass(frozen=True, slots=True)
 class ConnectionBudget:
