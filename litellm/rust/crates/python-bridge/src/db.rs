@@ -72,6 +72,20 @@ fn map_error(error: litellm_db::Error) -> PyErr {
     }
 }
 
+impl NativeDatabase {
+    pub(crate) fn pools(&self) -> &Pools {
+        &self.pools
+    }
+
+    pub(crate) fn writer_endpoint(&self) -> &Endpoint {
+        &self.writer_endpoint
+    }
+
+    pub(crate) fn events(&self) -> Arc<dyn Observer> {
+        Arc::clone(&self.events)
+    }
+}
+
 #[pymethods]
 impl NativeDatabase {
     #[staticmethod]

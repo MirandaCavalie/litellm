@@ -268,6 +268,13 @@ from litellm.proxy.db.log_db_metrics import (  # noqa: F401, RUF100  # legacy mo
     is_exception_related_to_db,
     log_db_metrics,
 )
+from litellm.proxy.db.native_spend_log_writer import (
+    dequeue_natively,
+    enqueue_natively,
+    native_spend_log_queue_size,
+    native_spend_log_writer,
+    write_natively,
+)
 from litellm.proxy.db.pgbouncer import database_url_is_pooled
 from litellm.proxy.db.prisma_client import (
     PrismaWrapper,
@@ -9011,6 +9018,9 @@ async def enqueue_spend_logs(
     dropped, which keeps a long outage from growing the queue until the pod
     dies.
     """
+    if (native_writer := native_spend_log_writer(prisma_client)) is not None:
+        enqueue_natively(native_writer, logs, at_head=at_head, max_bytes=max_bytes)
+        return
     added: Final = sum(spend_log_row_bytes(row) for row in logs)
     async with prisma_client._spend_log_transactions_lock:
         queued: Final[tuple[Mapping[str, object], ...]] = (
@@ -9062,6 +9072,8 @@ async def dequeue_spend_logs(prisma_client: PrismaClient, limit: int) -> list[di
     Every enqueue and dequeue goes through this pair so the byte total the
     queue is bounded by stays in step with what the queue actually holds.
     """
+    if (native_writer := native_spend_log_writer(prisma_client)) is not None:
+        return dequeue_natively(native_writer, limit)
     async with prisma_client._spend_log_transactions_lock:
         popped: Final = prisma_client.spend_log_transactions[:limit]
         prisma_client.spend_log_transactions[:] = prisma_client.spend_log_transactions[limit:]
@@ -9131,10 +9143,15 @@ class ProxyUpdateSpend:
     ):
         BATCH_SIZE: Final = 1000  # Preferred size of each batch to write to the database
         MAX_LOGS_PER_INTERVAL: Final = 10000  # Maximum number of logs to flush in a single interval
-        popped_batch = False
-        if logs_to_process is None:
-            logs_to_process = await dequeue_spend_logs(prisma_client, MAX_LOGS_PER_INTERVAL)
-            popped_batch = True
+        popped_batch: Final = logs_to_process is None
+        logs_to_process = (
+            logs_to_process
+            if logs_to_process is not None
+            else await dequeue_spend_logs(prisma_client, MAX_LOGS_PER_INTERVAL)
+        )
+        if (native_writer := native_spend_log_writer(prisma_client)) is not None:
+            await write_natively(native_writer, prisma_client, proxy_logging_obj, logs_to_process)
+            return
         if len(logs_to_process) > 0:
             verbose_proxy_logger.info(
                 "Spend tracking - processing %d spend logs for DB write",
@@ -9383,6 +9400,7 @@ async def _total_queued_spend_transactions(prisma_client: PrismaClient) -> int:
         baseline_queue_size: Final = len(prisma_client.baseline_accounting_transactions)
     return (
         spend_queue_size
+        + native_spend_log_queue_size(prisma_client)
         + tool_queue_size
         + model_usage_queue_size
         + autorouter_queue_size

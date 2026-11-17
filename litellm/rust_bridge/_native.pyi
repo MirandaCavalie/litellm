@@ -598,6 +598,7 @@ class RustAuth:
     def is_public_route(route: str, settings: RustAuthSettings) -> bool: ...
     @staticmethod
     def oauth2_introspection_applies(request: _AuthRequest, settings: RustAuthSettings) -> bool: ...
+
 @final
 class NativeAuthCache:
     def __new__(
@@ -702,6 +703,35 @@ class NativeDatabase:
     def set_reader_password(self, password: str) -> None: ...
     def health_check(self) -> Future[None]: ...
     def close(self) -> Future[None]: ...
+
+class NativeSpendLogWriteFailure(Exception):
+    requeue: bool
+    kind: str
+
+@final
+class NativeSpendLogWriter:
+    def __new__(
+        cls,
+        database: NativeDatabase,
+        *,
+        queue_max_bytes: int,
+        write_batch_max_bytes: int,
+        write_batch_max_rows: int,
+        queue_size_threshold: int,
+        poll_interval_seconds: float,
+        max_backoff_seconds: float,
+        max_depth: int,
+    ) -> NativeSpendLogWriter: ...
+    def enqueue(self, rows: Sequence[str], at_head: bool, max_bytes: int) -> tuple[int, list[int]]: ...
+    def dequeue(self, limit: int) -> list[str]: ...
+    def __len__(self) -> int: ...
+    @property
+    def queued_bytes(self) -> int: ...
+    def write(
+        self,
+        rows: Sequence[str],
+        retention: tuple[Sequence[str] | None, Sequence[str] | None, Sequence[str]] | None = None,
+    ) -> Future[None]: ...
 
 @final
 class NativeTokenRedactor:
@@ -927,6 +957,8 @@ __all__ = [
     "NativeSend",
     "NativeSensitiveRoutePins",
     "NativeSpendCounters",
+    "NativeSpendLogWriteFailure",
+    "NativeSpendLogWriter",
     "NativeTableSwapped",
     "NativeTokenRedactor",
     "NativeUsageRead",

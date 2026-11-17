@@ -4671,6 +4671,7 @@ dependencies = [
  "litellm-secrets-aws",
  "litellm-secrets-types",
  "litellm-spend-clickhouse",
+ "litellm-spend-log-writer",
  "litellm-storage-clickhouse",
  "litellm-token-counter",
  "litellm-tracing",
