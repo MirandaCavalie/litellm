@@ -17,10 +17,9 @@ import time
 from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from functools import partial
 from itertools import chain
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Final, Generic, Literal, NoReturn, Optional, Protocol, TypeAlias
+from typing import TYPE_CHECKING, Any, Final, Generic, Literal, NoReturn, Optional, Protocol, TypeAlias, TypeVar
 
 from fastapi import HTTPException, Request, status
 from pydantic import BaseModel, TypeAdapter, ValidationError
@@ -76,6 +75,7 @@ from litellm.proxy._types import (
     LiteLLM_TeamTable,
     LiteLLM_TeamTableCachedObj,
     LiteLLM_UserTable,
+    LiteLLM_VerificationTokenView,
     LiteLLMRoutes,
     LitellmUserRoles,
     ModelAccessDeniedProxyException,
@@ -143,6 +143,7 @@ from litellm.proxy.common_utils.user_api_key_cache import (
     team_membership_auth_cache_key,
     team_membership_reservation_cache_key,
 )
+from litellm.proxy.db import rust_database
 from litellm.proxy.db.db_lookup_gate import bounded_db_lookup, db_lookup_gate
 from litellm.proxy.db.exception_handler import PrismaDBExceptionHandler
 from litellm.proxy.guardrails.tool_name_extraction import (
@@ -176,9 +177,7 @@ from litellm.repositories.project_repository import ProjectRepository
 from litellm.repositories.table_repositories import (
     AccessGroupRepository,
     EndUserRepository,
-    JWTKeyMappingRepository,
     ManagedVectorStoresRepository,
-    ModelAccessGroupBudgetRepository,
     TagRepository,
     TeamMembershipRepository,
 )
@@ -187,7 +186,14 @@ from litellm.repositories.user_repository import UserRepository
 from litellm.responses.additional_tools import additional_tools_in_input
 from litellm.router import Router
 from litellm.router_api import RegistryReader
-from litellm.rust_bridge._native import jwt_key_mapping_cache_key
+from litellm.rust_bridge._native import (
+    NativeDatabase,
+    NativeDatabaseFailure,
+    RustJwtKeyMappingStore,
+    RustKeyStore,
+    RustModelAccessGroupStore,
+    jwt_key_mapping_cache_key,
+)
 from litellm.secret_managers.main import str_to_bool
 from litellm.types.proxy.auth.auth_checks import UserNotFoundError
 from litellm.types.proxy.model_access_group_budget import ModelAccessGroupBudget
@@ -220,13 +226,6 @@ else:
 
 class _PrismaDictableRow(Protocol):
     def dict(self) -> Mapping[str, object]: ...
-
-
-class _PrismaJWTKeyMappingRow(Protocol):
-    token: str
-    jwt_issuer: str
-    jwt_claim_name: str
-    jwt_claim_value: str
 
 
 class _PrismaModelDumpRow(Protocol):
@@ -338,12 +337,6 @@ def _dictable_table(repo: _PrismaTableHolder[_PrismaDictableRow], lookup: str) -
     return _DeadlineBoundedTable(repo.table, lookup)
 
 
-def _jwt_key_mapping_table(
-    repo: _PrismaTableHolder[_PrismaJWTKeyMappingRow],
-) -> _PrismaAuthTable[_PrismaJWTKeyMappingRow]:
-    return _DeadlineBoundedTable(repo.table, "jwt_key_mapping")
-
-
 def _model_dump_table(
     repo: _PrismaTableHolder[_PrismaModelDumpRow], lookup: str
 ) -> _PrismaAuthTable[_PrismaModelDumpRow]:
@@ -387,30 +380,6 @@ class _PrismaEndUserRow(Protocol):
 
 
 def _end_user_table(repo: _PrismaTableHolder[_PrismaEndUserRow]) -> _PrismaAuthTable[_PrismaEndUserRow]:
-    return repo.table
-
-
-class _PrismaMaxBudgetRow(Protocol):
-    @property
-    def max_budget(self) -> float | None: ...
-
-    @property
-    def budget_limits(self) -> object: ...
-
-
-class _PrismaModelAccessGroupBudgetRow(Protocol):
-    access_group_name: str
-
-    @property
-    def spend(self) -> float | None: ...
-
-    @property
-    def litellm_budget_table(self) -> _PrismaMaxBudgetRow | None: ...
-
-
-def _model_access_group_budget_table(
-    repo: _PrismaTableHolder[_PrismaModelAccessGroupBudgetRow],
-) -> _PrismaAuthTable[_PrismaModelAccessGroupBudgetRow]:
     return repo.table
 
 
@@ -2668,10 +2637,8 @@ async def _load_model_access_group_registry(
     """The set of model access group names that have a row in ``LiteLLM_ModelAccessGroupBudgetTable``."""
 
     async def fetch_ids() -> tuple[str, ...]:
-        registry_rows: Final = await _model_access_group_budget_table(
-            ModelAccessGroupBudgetRepository(prisma_client)
-        ).find_many(take=MODEL_ACCESS_GROUP_REGISTRY_MAX_SIZE + 1)
-        return tuple(row.access_group_name for row in registry_rows)
+        names: Final = await _rust_store(RustModelAccessGroupStore).names(MODEL_ACCESS_GROUP_REGISTRY_MAX_SIZE + 1)
+        return tuple(names)
 
     return await _load_bounded_registry(
         cache_key=model_access_group_registry_cache_key(),
@@ -2699,13 +2666,11 @@ async def _fetch_uncached_model_access_group_budgets(
         return ()
 
     try:
-        db_rows: Final = await _model_access_group_budget_table(
-            ModelAccessGroupBudgetRepository(prisma_client)
-        ).find_many(
-            where={"access_group_name": {"in": list(uncached_groups)}},
-            include={"litellm_budget_table": True},
+        budgets: Final = await _rust_store(RustModelAccessGroupStore).budgets(list(uncached_groups))
+        fetched: Final = tuple(
+            (name, _model_access_group_budget(name, spend, max_budget, has_budget_windows))
+            for name, spend, max_budget, has_budget_windows in budgets
         )
-        fetched: Final = tuple((row.access_group_name, _model_access_group_budget(row)) for row in db_rows)
         for fetched_name, fetched_obj in fetched:
             await user_api_key_cache.async_set_cache(
                 key=model_access_group_cache_key(fetched_name),
@@ -2722,17 +2687,14 @@ async def _fetch_uncached_model_access_group_budgets(
         return fetched
 
 
-def _model_access_group_budget(row: _PrismaModelAccessGroupBudgetRow) -> ModelAccessGroupBudget:
-    from litellm.proxy.management_helpers.utils import reject_budget_windows
+def _model_access_group_budget(
+    name: str, spend: float, max_budget: float | None, has_budget_windows: bool
+) -> ModelAccessGroupBudget:
+    if has_budget_windows:
+        from litellm.proxy.management_helpers.utils import reject_budget_windows
 
-    budget_table: Final = row.litellm_budget_table
-    if budget_table is not None:
-        reject_budget_windows({"budget_limits": budget_table.budget_limits})
-    return ModelAccessGroupBudget(
-        access_group_name=row.access_group_name,
-        spend=row.spend or 0.0,
-        max_budget=None if budget_table is None else budget_table.max_budget,
-    )
+        reject_budget_windows({"budget_limits": has_budget_windows})
+    return ModelAccessGroupBudget(access_group_name=name, spend=spend, max_budget=max_budget)
 
 
 @log_db_metrics
@@ -4468,21 +4430,14 @@ async def fetch_key_object_from_db_with_reconnect(
     deadline_seconds: float | None = None,
     *,
     check_db_only: bool = False,
-) -> BaseModel | None:
+) -> LiteLLM_VerificationTokenView | None:
     """
-    Fetch key object from DB and retry once if a DB connection error can be healed.
-    The gate wait, the query, the reconnect, and the retry share one deadline, so a
-    stalled database fails the request with ``DBLookupDeadlineExceeded`` instead of
-    parking it.
+    The key's ``combined_view`` row from the Rust key store, which also resolves a hash rotated away from a key
+    within its grace period. The gate wait and the read share one deadline, so a stalled database fails the
+    request with ``DBLookupDeadlineExceeded`` instead of parking it. ``check_db_only`` reads the writer.
     """
     return await bounded_db_lookup(
-        _fetch_key_object_from_db_unbounded(
-            hashed_token=hashed_token,
-            prisma_client=prisma_client,
-            parent_otel_span=parent_otel_span,
-            proxy_logging_obj=proxy_logging_obj,
-            check_db_only=check_db_only,
-        ),
+        _fetch_key_view(hashed_token, proxy_logging_obj, use_writer=check_db_only),
         name="key",
         deadline_seconds=deadline_seconds,
     )
@@ -4490,63 +4445,38 @@ async def fetch_key_object_from_db_with_reconnect(
 
 _fetch_key_object_from_db_with_reconnect: Final = fetch_key_object_from_db_with_reconnect
 
+StoreT = TypeVar("StoreT")
 
-async def _fetch_key_object_from_db_unbounded(
-    hashed_token: str,
-    prisma_client: PrismaClient,
-    parent_otel_span: Span | None,
-    proxy_logging_obj: ProxyLogging | None,
-    *,
-    check_db_only: bool = False,
-) -> BaseModel | None:
-    fetch: Final = partial(prisma_client.get_data, use_writer=True) if check_db_only else prisma_client.get_data
+
+def _rust_store(kind: Callable[[NativeDatabase], StoreT]) -> StoreT:
+    store: Final = rust_database.store(kind)
+    if store is None:
+        _raise_no_db_connected()
+    return store
+
+
+async def _fetch_key_view(
+    hashed_token: str, proxy_logging_obj: ProxyLogging | None, *, use_writer: bool
+) -> LiteLLM_VerificationTokenView | None:
+    store: Final = _rust_store(RustKeyStore)
     async with db_lookup_gate.current():
         try:
-            return await fetch(
-                token=hashed_token,
-                table_name="combined_view",
-                parent_otel_span=parent_otel_span,
-                proxy_logging_obj=proxy_logging_obj,
-            )
-        except Exception as e:
-            if PrismaDBExceptionHandler.is_database_transport_error(e):
-                did_reconnect = False
-                if hasattr(prisma_client, "attempt_db_reconnect"):
-                    auth_reconnect_timeout = getattr(prisma_client, "_db_auth_reconnect_timeout_seconds", 2.0)
-                    if not isinstance(auth_reconnect_timeout, (int, float)):
-                        auth_reconnect_timeout = 2.0
-                    auth_reconnect_lock_timeout = getattr(prisma_client, "_db_auth_reconnect_lock_timeout_seconds", 0.1)
-                    if not isinstance(auth_reconnect_lock_timeout, (int, float)):
-                        auth_reconnect_lock_timeout = 0.1
-                    did_reconnect = await prisma_client.attempt_db_reconnect(
-                        reason="auth_get_key_object_lookup_failure",
-                        timeout_seconds=auth_reconnect_timeout,
-                        lock_timeout_seconds=auth_reconnect_lock_timeout,
-                    )
-                if did_reconnect:
-                    return await fetch(
-                        token=hashed_token,
-                        table_name="combined_view",
-                        parent_otel_span=parent_otel_span,
-                        proxy_logging_obj=proxy_logging_obj,
-                    )
+            view: Final = await store.find(hashed_token, use_writer=use_writer)
+        except NativeDatabaseFailure as e:
+            if proxy_logging_obj is not None:
+                _ = asyncio.create_task(
+                    proxy_logging_obj.failure_handler(original_exception=e, duration=0.0, call_type="get_data")
+                )
             raise
+    return None if view is None else LiteLLM_VerificationTokenView.model_validate_json(view)
 
 
-@log_db_metrics
 async def get_jwt_key_mapping_cache_keys_for_token(
     hashed_token: str,
     prisma_client: PrismaClient,
 ) -> tuple[str, ...]:
     """Cache keys of every JWT claim mapped to the given virtual key."""
-    mappings: Final = await _jwt_key_mapping_table(JWTKeyMappingRepository(prisma_client)).find_many(
-        where={"token": hashed_token}
-    )
-    return tuple(jwt_key_mapping_cache_key(m.jwt_claim_name, m.jwt_claim_value, m.jwt_issuer) for m in mappings)
-
-
-class _TokenInFilter(TypedDict):
-    token: ReadOnly[Mapping[str, Sequence[str]]]
+    return await get_jwt_key_mapping_cache_keys_for_tokens((hashed_token,), prisma_client)
 
 
 async def get_jwt_key_mapping_cache_keys_for_tokens(
@@ -4556,12 +4486,12 @@ async def get_jwt_key_mapping_cache_keys_for_tokens(
     """Cache keys of every JWT claim mapped to any of the given virtual keys."""
     if not hashed_tokens:
         return ()
-    token_filter: Final[_TokenInFilter] = {"token": {"in": tuple(hashed_tokens)}}
-    mappings: Final = await _jwt_key_mapping_table(JWTKeyMappingRepository(prisma_client)).find_many(where=token_filter)
-    return tuple(jwt_key_mapping_cache_key(m.jwt_claim_name, m.jwt_claim_value, m.jwt_issuer) for m in mappings)
+    claims: Final = await bounded_db_lookup(
+        _rust_store(RustJwtKeyMappingStore).mapped_claims(list(hashed_tokens)), name="jwt_key_mapping"
+    )
+    return tuple(jwt_key_mapping_cache_key(name, value, issuer) for issuer, name, value in claims)
 
 
-@log_db_metrics
 async def get_jwt_key_mapping_object(
     jwt_claim_name: str,
     jwt_claim_value: str,
@@ -4577,17 +4507,10 @@ async def get_jwt_key_mapping_object(
 
     Returns the hashed token (str) if a matching active mapping is found, else None.
     """
-    mapping: Final = await _jwt_key_mapping_table(JWTKeyMappingRepository(prisma_client)).find_first(
-        where={
-            "jwt_claim_name": jwt_claim_name,
-            "jwt_claim_value": jwt_claim_value,
-            "jwt_issuer": jwt_issuer or "",
-            "is_active": True,
-        }
+    return await bounded_db_lookup(
+        _rust_store(RustJwtKeyMappingStore).mapped_token(jwt_claim_name, jwt_claim_value, jwt_issuer or None),
+        name="jwt_key_mapping",
     )
-    if mapping is not None:
-        return mapping.token
-    return None
 
 
 @log_db_metrics

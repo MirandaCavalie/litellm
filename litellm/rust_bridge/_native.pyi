@@ -1819,6 +1819,25 @@ class NativeDatabase:
     def close(self) -> Future[None]: ...
 
 @final
+class RustKeyStore:
+    def __new__(cls, database: NativeDatabase) -> RustKeyStore: ...
+    def find(self, token: str, *, use_writer: bool = False) -> Future[str | None]: ...
+
+@final
+class RustJwtKeyMappingStore:
+    def __new__(cls, database: NativeDatabase) -> RustJwtKeyMappingStore: ...
+    def mapped_token(
+        self, jwt_claim_name: str, jwt_claim_value: str, jwt_issuer: str | None = None
+    ) -> Future[str | None]: ...
+    def mapped_claims(self, tokens: Sequence[str]) -> Future[list[tuple[str, str, str]]]: ...
+
+@final
+class RustModelAccessGroupStore:
+    def __new__(cls, database: NativeDatabase) -> RustModelAccessGroupStore: ...
+    def names(self, limit: int) -> Future[list[str]]: ...
+    def budgets(self, names: Sequence[str]) -> Future[list[tuple[str, float, float | None, bool]]]: ...
+
+@final
 class NativeTokenRedactor:
     def __new__(cls, minimum_custom_key_length: int, word_ranges: Sequence[tuple[int, int]]) -> NativeTokenRedactor: ...
     def redact(self, text: str, replacement: str) -> str | None: ...
@@ -2059,9 +2078,12 @@ __all__ = [
     "RustClaimIdentity",
     "RustDenial",
     "RustIdentity",
+    "RustJwtKeyMappingStore",
     "RustJwtMapping",
     "RustKeyContext",
+    "RustKeyStore",
     "RustMappedClaims",
+    "RustModelAccessGroupStore",
     "RustPlan",
     "RustTeamGrant",
     "RustUpstreamError",

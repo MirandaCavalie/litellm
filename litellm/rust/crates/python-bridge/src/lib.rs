@@ -5,6 +5,7 @@ mod callable;
 mod coercion;
 mod credentials;
 mod db;
+mod db_store;
 mod diagnostics;
 mod errors;
 mod execution;
@@ -47,6 +48,8 @@ mod _native {
     use crate::budgets::budget_check_decision;
     #[pymodule_export]
     use crate::db::{NativeDatabase, NativeDatabaseFailure};
+    #[pymodule_export]
+    use crate::db_store::{RustJwtKeyMappingStore, RustKeyStore, RustModelAccessGroupStore};
     #[cfg(feature = "panic-test")]
     #[pymodule_export]
     use crate::diagnostics::_panic_for_test;
@@ -208,6 +211,9 @@ mod tests {
                 "NativeClickHouseSpendStorage",
                 "NativeDatabase",
                 "NativeDatabaseFailure",
+                "RustKeyStore",
+                "RustJwtKeyMappingStore",
+                "RustModelAccessGroupStore",
                 "trace_encode_error",
                 "bundled_model_cost_map",
                 "NativeModelCostMap",

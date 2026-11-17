@@ -3594,6 +3594,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "litellm-auth-store"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "litellm-db",
+ "litellm-error",
+ "litellm-python-compat",
+ "rstest",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "litellm-auth-types"
 version = "0.1.0"
 dependencies = [
@@ -4638,6 +4654,7 @@ dependencies = [
  "litellm-auth",
  "litellm-auth-aws",
  "litellm-auth-azure",
+ "litellm-auth-store",
  "litellm-cache",
  "litellm-cache-response",
  "litellm-callbacks",

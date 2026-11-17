@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final
 
 from litellm._logging import verbose_proxy_logger
+from litellm.proxy.db import rust_database
 from litellm.proxy.db.db_span import proxy_service_logging
 from litellm.proxy.db.native_database import (
     NativeEndpointSettings,
@@ -88,6 +89,7 @@ class Database:
             if reader_url is None
             else _token_refresh(native.set_reader_password, reader_token_rotation(reader_url), reader_url)
         )
+        rust_database.install(native)
         return cls(
             prisma=prisma,
             native=native,
@@ -104,6 +106,7 @@ class Database:
             await self.prisma.aclose()
         finally:
             if self.native is not None:
+                rust_database.clear(self.native)
                 await self.native.close()
 
 
