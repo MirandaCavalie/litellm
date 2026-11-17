@@ -1,3 +1,6 @@
+//! Error text scrubbing: prompt bodies echoed in provider errors, client IP addresses, and the raw
+//! model name a request asked for when the row stores a placeholder model.
+
 use std::sync::LazyLock;
 
 use fancy_regex::{Captures, Regex as FancyRegex};
@@ -5,7 +8,7 @@ use litellm_python_compat::{Value, json, repr};
 use regex::Regex;
 
 use crate::privacy::{REDACTED, TRUNCATED_FIELD, TRUNCATION_NOTE};
-use crate::py::{char_len, chars, slice};
+use crate::py::{char_len, slice};
 
 pub(crate) const UNKNOWN_MODEL: &str = "unknown-model";
 const IP_ADDRESS_CHARACTERS: &str = "0123456789abcdefABCDEF.:";
@@ -247,7 +250,7 @@ pub(crate) fn raw_model_spellings(raw_model: &str) -> Vec<String> {
 }
 
 fn overlap_at_end(text: &str, spelling: &str) -> usize {
-    let spelling_chars = chars(spelling);
+    let spelling_chars: Vec<char> = spelling.chars().collect();
     let longest = char_len(text).min(spelling_chars.len().saturating_sub(1));
     (1..=longest)
         .rev()
@@ -256,7 +259,7 @@ fn overlap_at_end(text: &str, spelling: &str) -> usize {
 }
 
 fn overlap_at_start(text: &str, spelling: &str) -> usize {
-    let spelling_chars = chars(spelling);
+    let spelling_chars: Vec<char> = spelling.chars().collect();
     let longest = char_len(text).min(spelling_chars.len().saturating_sub(1));
     (1..=longest)
         .rev()

@@ -1,10 +1,18 @@
+//! The prompt-bearing columns of the row: the stored request body (`proxy_server_request`), the
+//! response and the realtime messages. Each is stored only when prompt storage is on, trimmed to
+//! the latest turn when configured, redacted when message logging is off, then sanitized
+//! (credentials masked, tokens redacted, strings truncated) before it is dumped.
+
 use litellm_python_compat::{Value, truthy::truthy};
 
-use crate::SpendLogRowBuilder;
+use crate::compaction::{compaction_summary, summary_only_compaction_content};
+use crate::input::{LoggingPayload, RowInput};
 use crate::privacy::{TOOL_OUTPUT_BLOCK_TYPES, error_information_without_ip_addresses};
 use crate::py::{Dict, as_str, entries, get, get_or_none, has, safe_dumps, text};
+use crate::redaction::{redacted_request_body, redacted_response, should_redact};
+use crate::stamps::classifier_audit;
 use crate::text::masked_ip_text;
-use crate::{RowError, row::RowInput};
+use crate::{RowError, SpendLogRowBuilder};
 
 const RESPONSES_CALL_TYPES: [&str; 2] = ["responses", "aresponses"];
 const STATEFUL_REQUEST_KEYS: [&str; 2] = ["previous_response_id", "conversation"];
@@ -102,12 +110,14 @@ fn continues_stored_conversation(body: &Value, call_type: &Value) -> bool {
             .any(|key| truthy(get_or_none(body, key)))
 }
 
-fn replayed_by_responses_bridge(payload: Option<&Value>) -> bool {
+/// Whether the Responses API bridge answered the request through chat completions, whose stored
+/// request is kept whole.
+fn replayed_by_responses_bridge(payload: Option<&LoggingPayload>) -> bool {
     let Some(payload) = payload else {
         return false;
     };
-    matches!(get_or_none(payload, "call_type"), Value::Str(kind) if RESPONSES_CALL_TYPES.contains(&kind.as_str()))
-        && matches!(get_or_none(payload, "response"), response @ Value::Dict(_) if has(response, "choices"))
+    matches!(payload.get("call_type"), Value::Str(kind) if RESPONSES_CALL_TYPES.contains(&kind.as_str()))
+        && matches!(payload.get("response"), response @ Value::Dict(_) if has(response, "choices"))
 }
 
 fn kept_model(body: &Value) -> Dict {
@@ -233,34 +243,36 @@ fn stored_request_without_requester_ip_address(body: &Value) -> Value {
 }
 
 impl SpendLogRowBuilder {
-    pub(crate) fn messages_json(&self, input: &RowInput<'_>) -> Result<String, RowError> {
-        let Some(payload) = input.payload else {
+    /// `_get_messages_for_spend_logs_payload`: only realtime calls store their messages.
+    pub(crate) fn messages_json(&self, input: &RowInput) -> Result<String, RowError> {
+        let Some(payload) = &input.payload else {
             return Ok("{}".to_owned());
         };
-        if !self.stores_prompts(input.metadata) {
+        if !self.stores_prompts(&input.metadata) {
             return Ok("{}".to_owned());
         }
-        if !matches!(get_or_none(payload, "call_type"), Value::Str(kind) if kind == "_arealtime") {
+        if !matches!(payload.get("call_type"), Value::Str(kind) if kind == "_arealtime") {
             return Ok("{}".to_owned());
         }
-        match get_or_none(payload, "messages") {
+        match payload.get("messages") {
             Value::None => Ok("{}".to_owned()),
             messages => Ok(self.without_tokens(&safe_dumps(messages, true)?)),
         }
     }
 
-    pub(crate) fn response_json(&self, input: &RowInput<'_>) -> Result<String, RowError> {
-        let Some(payload) = input.payload else {
+    /// `_get_response_for_spend_logs_payload`.
+    pub(crate) fn response_json(&self, input: &RowInput) -> Result<String, RowError> {
+        let Some(payload) = &input.payload else {
             return Ok("{}".to_owned());
         };
-        if !self.stores_prompts(input.metadata) {
+        if !self.stores_prompts(&input.metadata) {
             return Ok("{}".to_owned());
         }
-        let response = get_or_none(payload, "response");
+        let response = payload.get("response");
         if matches!(response, Value::None) {
             return Ok("{}".to_owned());
         }
-        let tool_calls = get_or_none(input.kwargs, "realtime_tool_calls");
+        let tool_calls = &input.kwargs.realtime_tool_calls;
         let response = match response {
             Value::Dict(items) if truthy(tool_calls) => {
                 let mut with_tool_calls = Dict::from_entries(items);
@@ -269,7 +281,12 @@ impl SpendLogRowBuilder {
             }
             other => other.clone(),
         };
-        let wrapper = self.sanitize_body(&[(text("response"), response)], true);
+        let response = if should_redact(&self.config, input) {
+            redacted_response(&response)
+        } else {
+            response
+        };
+        let wrapper = self.sanitize_body(&[(text("response"), response)], true, true);
         match get_or_none(&wrapper, "response") {
             Value::None => Ok("{}".to_owned()),
             Value::Str(content) => Ok(content.replace('\0', "")),
@@ -277,15 +294,17 @@ impl SpendLogRowBuilder {
         }
     }
 
+    /// `_get_proxy_server_request_for_spend_logs_payload`, given the request's
+    /// `proxy_server_request` (absent, `None`, or the proxy's record of the client request).
     pub(crate) fn proxy_server_request_json(
         &self,
-        input: &RowInput<'_>,
-        litellm_params: &Value,
+        input: &RowInput,
+        proxy_server_request: Option<&Value>,
     ) -> Result<String, RowError> {
-        if !self.stores_prompts(input.metadata) {
+        if !self.stores_prompts(&input.metadata) {
             return Ok("{}".to_owned());
         }
-        let proxy_server_request = match get(litellm_params, "proxy_server_request") {
+        let proxy_server_request = match proxy_server_request {
             Some(Value::None) => return Ok("{}".to_owned()),
             Some(found) => found,
             None => &Value::Dict(Vec::new()),
@@ -300,32 +319,70 @@ impl SpendLogRowBuilder {
             &[]
         });
         if input.payload.is_some() {
-            body.extend(entries(input.classifier_audit).unwrap_or_default());
+            body.extend(entries(&classifier_audit(input)).unwrap_or_default());
         }
-        let realtime_tools = get_or_none(input.kwargs, "realtime_tools");
+        let realtime_tools = &input.kwargs.realtime_tools;
         if truthy(realtime_tools) {
             body.set("tools", realtime_tools.clone());
         }
         let body = body.into_value();
-        let selected =
-            if !self.config.latest_turn_only || replayed_by_responses_bridge(input.payload) {
-                body
-            } else {
-                match input.payload {
-                    None => latest_turn_body(&body, &Value::None, &Value::None),
-                    Some(payload) => latest_turn_body(
-                        &body,
-                        get_or_none(payload, "call_type"),
-                        get_or_none(payload, "originating_request_masked"),
-                    ),
-                }
-            };
-        let stored = self.sanitize_body(entries(&selected).unwrap_or_default(), true);
+        let payload = input.payload.as_ref();
+        let selected = if !self.config.latest_turn_only || replayed_by_responses_bridge(payload) {
+            body
+        } else {
+            match payload {
+                None => latest_turn_body(&body, &Value::None, &Value::None),
+                Some(payload) => latest_turn_body(
+                    &body,
+                    payload.get("call_type"),
+                    payload.get("originating_request_masked"),
+                ),
+            }
+        };
+        let selected = if should_redact(&self.config, input) {
+            redacted_request_body(&selected)
+        } else {
+            selected
+        };
+        let stored = self.sanitized_request_body(&selected);
         let stored = if self.config.drop_requester_ip_address {
             stored_request_without_requester_ip_address(&stored)
         } else {
             stored
         };
         safe_dumps(&stored, true)
+    }
+
+    /// `_sanitize_proxy_server_request_body(body)`: the sanitized body, with each Responses API
+    /// `compaction` input item reduced to its bounded summary.
+    fn sanitized_request_body(&self, body: &Value) -> Value {
+        let sanitized = self.sanitize_body(entries(body).unwrap_or_default(), true, false);
+        let (Value::List(items), Some(Value::List(stored_items))) =
+            (get_or_none(body, "input"), get(&sanitized, "input"))
+        else {
+            return sanitized;
+        };
+        let input = items
+            .iter()
+            .zip(stored_items)
+            .map(
+                |(item, stored_item)| match (compaction_summary(item), stored_item) {
+                    (Some(summary), Value::Dict(stored_entries)) => {
+                        let mut bounded = Dict::from_entries(stored_entries);
+                        bounded.set(
+                            "encrypted_content",
+                            Value::Str(summary_only_compaction_content(
+                                &self.compaction_summary_for_db(&summary),
+                            )),
+                        );
+                        bounded.into_value()
+                    }
+                    _ => stored_item.clone(),
+                },
+            )
+            .collect();
+        let mut with_input = Dict::from_entries(entries(&sanitized).unwrap_or_default());
+        with_input.set("input", Value::List(input));
+        with_input.into_value()
     }
 }

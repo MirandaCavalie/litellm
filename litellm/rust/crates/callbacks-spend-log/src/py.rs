@@ -1,32 +1,19 @@
-use litellm_python_compat::{BigInt, Value, repr, truthy::truthy};
+//! Value helpers shared by the row builder: the Python dict and str operations from
+//! `litellm-python-compat`, and a port of LiteLLM's `safe_json_structure`, which decides what
+//! every JSON column of the row holds.
+
+use litellm_python_compat::{BigInt, Value, repr};
 use num_traits::ToPrimitive;
+
+pub(crate) use litellm_python_compat::dict::{Dict, entries, get, get_or_none, has};
+pub(crate) use litellm_python_compat::pystr::{len as char_len, slice};
+pub(crate) use litellm_python_compat::truthy::{or, truthy};
 
 use crate::RowError;
 
 pub(crate) const NONE: Value = Value::None;
 
-pub(crate) fn get<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
-    entries(value)?
-        .iter()
-        .find(|(name, _)| matches!(name, Value::Str(name) if name == key))
-        .map(|(_, item)| item)
-}
-
-pub(crate) fn get_or_none<'a>(value: &'a Value, key: &str) -> &'a Value {
-    get(value, key).unwrap_or(&NONE)
-}
-
-pub(crate) fn has(value: &Value, key: &str) -> bool {
-    get(value, key).is_some()
-}
-
-pub(crate) fn entries(value: &Value) -> Option<&[(Value, Value)]> {
-    match value {
-        Value::Dict(entries) => Some(entries),
-        _ => None,
-    }
-}
-
+/// `value[key]` where Python requires `value` to be a dict, failing with the field's name otherwise.
 pub(crate) fn dict_get<'a>(
     value: &'a Value,
     key: &str,
@@ -45,22 +32,21 @@ pub(crate) fn as_str(value: &Value) -> Option<&str> {
     }
 }
 
+/// `value is True`.
 pub(crate) fn is_true(value: &Value) -> bool {
     matches!(value, Value::Bool(true))
-}
-
-pub(crate) fn or<'a>(first: &'a Value, second: &'a Value) -> &'a Value {
-    if truthy(first) { first } else { second }
 }
 
 pub(crate) fn text(value: &str) -> Value {
     Value::Str(value.to_owned())
 }
 
+/// `str(value)`.
 pub(crate) fn to_str(value: &Value) -> String {
     repr::to_str(value)
 }
 
+/// `value if isinstance(value, str) else ""`.
 pub(crate) fn string_or_empty(value: &Value) -> Value {
     match value {
         Value::Str(_) => value.clone(),
@@ -76,77 +62,7 @@ pub(crate) fn big_to_f64(value: &BigInt) -> Option<f64> {
     value.to_f64().filter(|number| number.is_finite())
 }
 
-#[derive(Clone, Debug, Default)]
-pub(crate) struct Dict(Vec<(Value, Value)>);
-
-impl Dict {
-    pub(crate) fn from_entries(entries: &[(Value, Value)]) -> Self {
-        Self(entries.to_vec())
-    }
-
-    pub(crate) fn set(&mut self, key: &str, value: Value) {
-        match self
-            .0
-            .iter_mut()
-            .find(|(name, _)| matches!(name, Value::Str(name) if name == key))
-        {
-            Some(slot) => slot.1 = value,
-            None => self.0.push((text(key), value)),
-        }
-    }
-
-    pub(crate) fn set_value(&mut self, key: Value, value: Value) {
-        match self.0.iter_mut().find(|(name, _)| *name == key) {
-            Some(slot) => slot.1 = value,
-            None => self.0.push((key, value)),
-        }
-    }
-
-    pub(crate) fn extend(&mut self, entries: &[(Value, Value)]) {
-        for (key, value) in entries {
-            self.set_value(key.clone(), value.clone());
-        }
-    }
-
-    pub(crate) fn get(&self, key: &str) -> Option<&Value> {
-        self.0
-            .iter()
-            .find(|(name, _)| matches!(name, Value::Str(name) if name == key))
-            .map(|(_, value)| value)
-    }
-
-    pub(crate) fn into_value(self) -> Value {
-        Value::Dict(self.0)
-    }
-}
-
-pub(crate) fn chars(value: &str) -> Vec<char> {
-    value.chars().collect()
-}
-
-pub(crate) fn char_len(value: &str) -> usize {
-    value.chars().count()
-}
-
-fn clamp_index(index: i64, length: i64) -> i64 {
-    if index < 0 {
-        (index + length).max(0)
-    } else {
-        index.min(length)
-    }
-}
-
-pub(crate) fn slice(value: &str, start: Option<i64>, end: Option<i64>) -> String {
-    let characters = chars(value);
-    let length = characters.len() as i64;
-    let from = clamp_index(start.unwrap_or(0), length);
-    let to = clamp_index(end.unwrap_or(length), length);
-    if from >= to {
-        return String::new();
-    }
-    characters[from as usize..to as usize].iter().collect()
-}
-
+/// Options of LiteLLM's `safe_json_structure`.
 pub(crate) struct Structure {
     pub(crate) non_finite_as_null: bool,
     pub(crate) integer_limit: Option<i64>,
@@ -154,6 +70,9 @@ pub(crate) struct Structure {
 
 const MAX_DEPTH: usize = 100;
 
+/// LiteLLM's `safe_json_structure`: NUL bytes stripped from every string and key, non-string keys
+/// dropped, containers past a depth of 100 replaced by a marker, and optionally non-finite floats
+/// nulled and integers clamped.
 pub(crate) fn safe_structure(value: &Value, options: &Structure) -> Value {
     structure_at(value, 0, options)
 }
@@ -195,6 +114,7 @@ fn structure_at(value: &Value, depth: usize, options: &Structure) -> Value {
     }
 }
 
+/// LiteLLM's `safe_dumps`: `json.dumps(safe_json_structure(value))`.
 pub(crate) fn safe_dumps(value: &Value, non_finite_as_null: bool) -> Result<String, RowError> {
     let structure = safe_structure(
         value,

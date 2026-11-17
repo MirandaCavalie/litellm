@@ -3852,6 +3852,7 @@ dependencies = [
 name = "litellm-callbacks-spend-log"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "fancy-regex 0.19.2",
  "litellm-python-compat",
  "litellm-tracing",

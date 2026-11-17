@@ -1,13 +1,20 @@
+//! What the row may keep of prompts and credentials: the prompt storage decision, credential
+//! masking and truncation of stored request and response bodies, token redaction, and the
+//! redaction of guardrail records, vector store results and error text when prompts are not
+//! stored in full.
+
 use litellm_python_compat::{Value, flags};
 
 use crate::SpendLogRowBuilder;
-use crate::py::{Dict, as_str, char_len, entries, get_or_none, has, slice, text};
+use crate::compaction::{compaction_summary, is_compaction_item, with_compaction_summary};
+use crate::py::{Dict, as_str, char_len, entries, get_or_none, has, slice, text, truthy};
 use crate::text::{masked_ip_text, redact_prompt_leaks_in_error_string};
 
 pub(crate) const REDACTED: &str = "REDACTED_BY_LITELM";
 pub(crate) const TRUNCATED_FIELD: &str = "litellm_truncated";
 pub(crate) const TRUNCATION_NOTE: &str = "Truncation is a DB storage safeguard. Full, untruncated data is logged to logging callbacks (OTEL, Datadog, etc.). To increase the truncation limit, set `MAX_STRING_LENGTH_PROMPT_IN_DB` in your env.";
 const MINIMUM_TOKEN_LENGTH: usize = 15;
+const MAX_STRING_LENGTH_COMPACTION_SUMMARY_IN_DB: i64 = 64 * 1024;
 const TENANT_PROMPT_STORAGE_FIELDS: [&str; 2] =
     ["user_api_key_metadata", "user_api_key_team_metadata"];
 const SENSITIVE_PATTERNS: [&str; 15] = [
@@ -60,11 +67,7 @@ impl SpendLogRowBuilder {
         {
             return false;
         }
-        match &self.config.store_prompts_in_spend_logs {
-            Value::Bool(true) => true,
-            Value::Str(setting) if setting.to_lowercase() == "true" => true,
-            _ => self.config.store_prompts_in_spend_logs_env,
-        }
+        self.config.store_prompts
     }
 
     pub(crate) fn stores_full_prompts(&self, metadata: &Value) -> bool {
@@ -86,33 +89,88 @@ impl SpendLogRowBuilder {
         truncated(value, self.config.max_string_length_prompt_in_db)
     }
 
-    pub(crate) fn sanitize_body(&self, body: &[(Value, Value)], mask_credentials: bool) -> Value {
+    /// `_compaction_summary_for_db(summary)`.
+    pub(crate) fn compaction_summary_for_db(&self, summary: &str) -> String {
+        truncated(
+            &self.without_tokens(summary),
+            self.config
+                .max_string_length_prompt_in_db
+                .max(MAX_STRING_LENGTH_COMPACTION_SUMMARY_IN_DB),
+        )
+    }
+
+    /// `_bounded_compaction_summary(parent, key, value, keep_compaction_blocks)`.
+    fn bounded_compaction_summary(
+        &self,
+        parent: &Value,
+        key: &str,
+        value: &Value,
+    ) -> Option<String> {
+        let Value::Str(content) = value else {
+            return None;
+        };
+        if !is_compaction_item(parent) {
+            return None;
+        }
+        match key {
+            "content" => Some(self.compaction_summary_for_db(content)),
+            "encrypted_content" => compaction_summary(parent).map(|summary| {
+                with_compaction_summary(content, &self.compaction_summary_for_db(&summary))
+            }),
+            _ => None,
+        }
+    }
+
+    /// `_sanitize_request_body_for_spend_logs_payload(body, mask_credentials=...,
+    /// keep_compaction_blocks=...)`: drops `secret_fields`, masks credential-named string values
+    /// outside tool payloads, redacts tokens and truncates every string.
+    pub(crate) fn sanitize_body(
+        &self,
+        body: &[(Value, Value)],
+        mask_credentials: bool,
+        keep_compaction_blocks: bool,
+    ) -> Value {
+        let parent = Value::Dict(body.to_vec());
         let mut result = Dict::default();
         for (key, value) in body {
             if matches!(key, Value::Str(name) if name == "secret_fields") {
                 continue;
             }
             let name = as_str(key).unwrap_or_default();
-            let stored = if mask_credentials
-                && matches!(value, Value::Str(_))
-                && is_sensitive_key(name)
-            {
-                text(REDACTED)
-            } else {
-                self.sanitize_value(value, mask_credentials && !is_spend_log_content(body, name))
-            };
+            let stored =
+                if mask_credentials && matches!(value, Value::Str(_)) && is_sensitive_key(name) {
+                    text(REDACTED)
+                } else if let Some(bounded) = keep_compaction_blocks
+                    .then(|| self.bounded_compaction_summary(&parent, name, value))
+                    .flatten()
+                {
+                    Value::Str(bounded)
+                } else {
+                    self.sanitize_value(
+                        value,
+                        mask_credentials && !is_spend_log_content(body, name),
+                        keep_compaction_blocks,
+                    )
+                };
             result.set_value(key.clone(), stored);
         }
         result.into_value()
     }
 
-    fn sanitize_value(&self, value: &Value, mask_credentials: bool) -> Value {
+    fn sanitize_value(
+        &self,
+        value: &Value,
+        mask_credentials: bool,
+        keep_compaction_blocks: bool,
+    ) -> Value {
         match value {
-            Value::Dict(items) => self.sanitize_body(items, mask_credentials),
+            Value::Dict(items) => {
+                self.sanitize_body(items, mask_credentials, keep_compaction_blocks)
+            }
             Value::List(items) => Value::List(
                 items
                     .iter()
-                    .map(|item| self.sanitize_value(item, mask_credentials))
+                    .map(|item| self.sanitize_value(item, mask_credentials, keep_compaction_blocks))
                     .collect(),
             ),
             Value::Str(content) => Value::Str(self.truncated_for_db(&self.without_tokens(content))),
@@ -180,7 +238,7 @@ impl SpendLogRowBuilder {
                 }
             }
         }
-        let sanitized = self.sanitize_body(&dict_entries(sanitized.into_value()), true);
+        let sanitized = self.sanitize_body(&dict_entries(sanitized.into_value()), true, false);
         if self.config.drop_requester_ip_address {
             error_information_without_ip_addresses(&sanitized)
         } else {
@@ -271,7 +329,7 @@ fn redacted_vector_store_request(request: &Value) -> Value {
         return request.clone();
     };
     let found = get_or_none(request, "vector_store_search_response");
-    let response = if litellm_python_compat::truthy::truthy(found) {
+    let response = if truthy(found) {
         found.clone()
     } else {
         Value::Dict(Vec::new())

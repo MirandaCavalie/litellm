@@ -116,7 +116,7 @@ mod _native {
     #[pymodule_export]
     use crate::s3_log::NativeS3Log;
     #[pymodule_export]
-    use crate::spend_log_rows::NativeSpendLogRowBuilder;
+    use crate::spend_log_rows::RustSpendLogRowBuilder;
     #[cfg(feature = "huggingface")]
     #[pymodule_export]
     use crate::tokenizer::HuggingFaceEncoding;
@@ -172,7 +172,7 @@ mod tests {
                 "ResponsesWebSocketConnection",
                 "NativeDiagnosticProcessor",
                 "NativeTokenRedactor",
-                "NativeSpendLogRowBuilder",
+                "RustSpendLogRowBuilder",
                 "NativeRedisClient",
                 "NativeRedisBreaker",
                 "NativeAdmission",

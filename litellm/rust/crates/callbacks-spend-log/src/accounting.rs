@@ -1,8 +1,12 @@
+//! The spend logs ledger's half of the row: the billable spend, the delivery id that dedupes the
+//! accounting worker's writes, and the accounting payload (`build_accounting_payload`), which
+//! carries the guardrail share of spend and the entities, windows and savings the worker debits.
+
 use litellm_python_compat::{Value, json, number, pydantic};
 
 use crate::RowError;
 use crate::py::{
-    Dict, Structure, as_str, big_to_f64, entries, get, get_or_none, safe_structure, text,
+    Dict, Structure, as_str, big_to_f64, entries, get, get_or_none, safe_structure, text, truthy,
 };
 
 const JSON_SAFE_INTEGER: i64 = (1 << 53) - 1;
@@ -54,14 +58,16 @@ const GUARDRAIL_ACCOUNTING_FIELDS: [&str; 6] = [
 ];
 const VIDEO_STATUS_CALL_TYPES: [&str; 2] = ["video_status", "avideo_status"];
 
+/// A Python number result that keeps `int` and `float` apart, since `json.dumps` writes them
+/// differently.
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Number {
+pub(crate) enum Number {
     Int(i64),
     Float(f64),
 }
 
 impl Number {
-    fn value(self) -> f64 {
+    pub(crate) fn value(self) -> f64 {
         match self {
             Number::Int(number) => number as f64,
             Number::Float(number) => number,
@@ -76,24 +82,13 @@ impl Number {
     }
 }
 
-fn lax_float(value: &Value) -> Option<f64> {
-    match value {
-        Value::Float(number) => Some(*number),
-        Value::Int(number) => big_to_f64(number),
-        Value::Bool(flag) => Some(f64::from(u8::from(*flag))),
-        Value::Str(content) => number::float(content),
-        Value::Bytes(content) => std::str::from_utf8(content).ok().and_then(number::float),
-        _ => None,
-    }
-}
-
 fn entry_cost(entry: &Value) -> f64 {
     let Value::Dict(_) = entry else {
         return 0.0;
     };
     let cost = match get_or_none(entry, "guardrail_cost") {
         Value::None => None,
-        found => match lax_float(found) {
+        found => match pydantic::lax_float(found) {
             Some(cost) => Some(cost),
             None => return 0.0,
         },
@@ -115,33 +110,14 @@ fn entry_cost(entry: &Value) -> f64 {
     }
 }
 
-fn guardrail_information_cost(information: &Value) -> Number {
+/// `guardrail_information_cost(guardrail_information)`: the billable cost of the guardrail records.
+pub(crate) fn guardrail_information_cost(information: &Value) -> Number {
     match information {
         Value::None => Number::Float(0.0),
-        Value::List(items) | Value::Tuple(items) => python_float_sum(items.iter().map(entry_cost)),
-        other => Number::Float(entry_cost(other)),
-    }
-}
-
-fn python_float_sum(costs: impl Iterator<Item = f64>) -> Number {
-    let mut total = None;
-    let mut compensation = 0.0;
-    for cost in costs {
-        let running: f64 = total.unwrap_or(0.0);
-        let next = running + cost;
-        compensation += if running.abs() >= cost.abs() {
-            (running - next) + cost
-        } else {
-            (cost - next) + running
-        };
-        total = Some(next);
-    }
-    match total {
-        None => Number::Int(0),
-        Some(total) if compensation != 0.0 && compensation.is_finite() => {
-            Number::Float(total + compensation)
+        Value::List(items) | Value::Tuple(items) => {
+            number::float_sum(items.iter().map(entry_cost)).map_or(Number::Int(0), Number::Float)
         }
-        Some(total) => Number::Float(total),
+        other => Number::Float(entry_cost(other)),
     }
 }
 
@@ -208,7 +184,34 @@ fn accounting_guardrail_entries(value: &Value) -> Value {
     )
 }
 
+/// What the accounting worker debits besides the row itself, resolved in Python from the
+/// request's key, team and customer state.
+struct AccountingInput {
+    entities: Value,
+    savings: Value,
+    model_access_groups: Value,
+    windows: Value,
+}
+
+impl AccountingInput {
+    fn parse(input: &Value) -> Result<Self, RowError> {
+        let field = |name: &'static str| get(input, name).cloned().ok_or(RowError::Missing(name));
+        Ok(Self {
+            entities: field("entities")?,
+            savings: field("savings")?,
+            model_access_groups: field("model_access_groups")?,
+            windows: field("windows")?,
+        })
+    }
+}
+
+/// `build_accounting_payload(row, entities=..., model_access_groups=..., windows=..., router=...)`,
+/// with the savings already priced in Python.
 pub fn build_accounting_payload(row: &Value, input: &Value) -> Result<Value, RowError> {
+    accounting_payload(row, &AccountingInput::parse(input)?)
+}
+
+fn accounting_payload(row: &Value, input: &AccountingInput) -> Result<Value, RowError> {
     let metadata = match get(row, "metadata") {
         Some(Value::Str(metadata)) => json::loads(metadata)?,
         _ => return Err(RowError::Type("metadata")),
@@ -226,18 +229,17 @@ pub fn build_accounting_payload(row: &Value, input: &Value) -> Result<Value, Row
         };
         accounting_metadata.set_value(key.clone(), stored);
     }
-    let input_field = |name: &'static str| get(input, name).cloned().ok_or(RowError::Missing(name));
-    accounting_metadata.set("accounting_entities", input_field("entities")?);
-    accounting_metadata.set("accounting_savings", input_field("savings")?);
+    accounting_metadata.set("accounting_entities", input.entities.clone());
+    accounting_metadata.set("accounting_savings", input.savings.clone());
     accounting_metadata.set(
         "accounting_guardrail_spend",
         guardrail_share_of_spend(&metadata, get_or_none(row, "spend"))?.into_value(),
     );
     accounting_metadata.set(
         "accounting_model_access_groups",
-        input_field("model_access_groups")?,
+        input.model_access_groups.clone(),
     );
-    accounting_metadata.set("accounting_windows", input_field("windows")?);
+    accounting_metadata.set("accounting_windows", input.windows.clone());
     let mut payload = Dict::default();
     for (key, value) in entries(row).ok_or(RowError::NotAMapping("row"))? {
         if as_str(key).is_some_and(|name| ACCOUNTING_FIELDS.contains(&name)) {
@@ -254,7 +256,8 @@ pub fn build_accounting_payload(row: &Value, input: &Value) -> Result<Value, Row
     ))
 }
 
-fn finite_cost(value: &Value) -> Option<f64> {
+/// `finite_cost(value)`: a finite number as a float, else `None`.
+pub(crate) fn finite_cost(value: &Value) -> Option<f64> {
     match value {
         Value::Float(number) if number.is_finite() => Some(*number),
         Value::Int(number) => big_to_f64(number),
@@ -278,27 +281,49 @@ fn settles_once(row: &Value) -> bool {
     }
 }
 
+/// The writer's ledger inputs for one row.
+struct LedgerInput {
+    billable_cost: Option<f64>,
+    org_id: Value,
+    team_id: Value,
+    delivery_id: Value,
+    accounting: AccountingInput,
+}
+
+impl LedgerInput {
+    fn parse(input: &Value) -> Result<Self, RowError> {
+        Ok(Self {
+            billable_cost: finite_cost(get_or_none(input, "response_cost"))
+                .filter(|cost| *cost != 0.0),
+            org_id: get_or_none(input, "org_id").clone(),
+            team_id: get_or_none(input, "team_id").clone(),
+            delivery_id: get(input, "delivery_id")
+                .cloned()
+                .ok_or(RowError::Missing("delivery_id"))?,
+            accounting: AccountingInput::parse(input)?,
+        })
+    }
+}
+
+/// The row as the writer stores it on the ledger path: spend set to the billable cost, the
+/// org and team the request resolved to, a delivery id unless a settle-once poll carries it,
+/// and the accounting payload.
 pub fn finalize_ledger_row(row: &Value, input: &Value) -> Result<Value, RowError> {
+    let input = LedgerInput::parse(input)?;
     let mut finalized = Dict::from_entries(entries(row).ok_or(RowError::NotAMapping("row"))?);
-    let billable_cost =
-        finite_cost(get_or_none(input, "response_cost")).filter(|cost| *cost != 0.0);
-    finalized.set("spend", Value::Float(billable_cost.unwrap_or(0.0)));
-    for (field, input_name) in [("organization_id", "org_id"), ("team_id", "team_id")] {
-        let value = get_or_none(input, input_name);
-        if litellm_python_compat::truthy::truthy(value) {
+    finalized.set("spend", Value::Float(input.billable_cost.unwrap_or(0.0)));
+    for (field, value) in [
+        ("organization_id", &input.org_id),
+        ("team_id", &input.team_id),
+    ] {
+        if truthy(value) {
             finalized.set(field, value.clone());
         }
     }
-    let finalized_row = finalized.clone().into_value();
-    if !settles_once(&finalized_row) {
-        finalized.set(
-            "accounting_delivery_id",
-            get(input, "delivery_id")
-                .cloned()
-                .ok_or(RowError::Missing("delivery_id"))?,
-        );
+    if !settles_once(&finalized.clone().into_value()) {
+        finalized.set("accounting_delivery_id", input.delivery_id.clone());
     }
-    let accounting = build_accounting_payload(&finalized.clone().into_value(), input)?;
+    let accounting = accounting_payload(&finalized.clone().into_value(), &input.accounting)?;
     finalized.set("accounting_payload", accounting);
     Ok(finalized.into_value())
 }

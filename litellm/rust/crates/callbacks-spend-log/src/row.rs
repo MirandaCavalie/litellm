@@ -1,16 +1,23 @@
+//! The `LiteLLM_SpendLogs` row: `get_logging_payload` from
+//! `litellm/proxy/spend_tracking/spend_tracking_utils.py`, applied to the typed [`RowInput`].
+//! It resolves the row's identity columns (request id, api key hash, model, model group,
+//! provider, session), the cleaned metadata JSON, token counts and timings, and delegates the
+//! prompt-bearing columns to [`crate::request`].
+
 use std::sync::LazyLock;
 
-use litellm_python_compat::{
-    Value, datetime::IsoDateTime, datetime::fromisoformat, repr, truthy::truthy, unicode,
-};
+use litellm_python_compat::{Value, datetime::IsoDateTime, repr, truthy::truthy, unicode};
 use regex::Regex;
 use sha2::{Digest, Sha256};
 
+use crate::input::{LoggingPayload, RowInput, Timestamp};
 use crate::privacy::SCRUBBED_ERROR_TEXT_FIELDS;
 use crate::py::{
     Dict, NONE, as_str, dict_get, entries, get, get_or_none, has, int, is_true, or, safe_dumps,
     string_or_empty, text, to_str,
 };
+use crate::request_id::spend_logs_id;
+use crate::stamps;
 use crate::text::{UNKNOWN_MODEL, raw_model_spellings, scrub_raw_model_from_error_text};
 use crate::{RowError, SpendLogRowBuilder};
 
@@ -128,17 +135,6 @@ static HASHED_JWT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\Ahashed-jwt-[a-fA-F0-9]{64}\z").expect("hashed jwt pattern compiles")
 });
 
-pub(crate) struct RowInput<'a> {
-    pub(crate) metadata: &'a Value,
-    pub(crate) kwargs: &'a Value,
-    pub(crate) payload: Option<&'a Value>,
-    pub(crate) classifier_audit: &'a Value,
-}
-
-fn required<'a>(input: &'a Value, key: &'static str) -> Result<&'a Value, RowError> {
-    get(input, key).ok_or(RowError::Missing(key))
-}
-
 fn strip_bearer(value: &str) -> &str {
     match value.get(..7) {
         Some(prefix) if prefix.eq_ignore_ascii_case("bearer ") => &value[7..],
@@ -240,18 +236,20 @@ fn scrub_raw_model_from_error_information(information: &Value, raw_model: &str) 
     )
 }
 
-fn placeholder_stored_request_body(
-    litellm_params: &Value,
+/// `_placeholder_stored_request_body`: when the row's model is a placeholder, the stored request
+/// body's model, model group and error text must not leak the raw model either.
+fn placeholder_stored_request(
+    proxy_server_request: Option<&Value>,
     persisted_model_group: &Value,
     raw_model: &str,
-) -> Value {
-    let Some(proxy_server_request @ Value::Dict(request_items)) =
-        get(litellm_params, "proxy_server_request")
-    else {
-        return litellm_params.clone();
+) -> Option<Value> {
+    let Some(Value::Dict(request_items)) = proxy_server_request else {
+        return proxy_server_request.cloned();
     };
-    let Some(body @ Value::Dict(body_items)) = get(proxy_server_request, "body") else {
-        return litellm_params.clone();
+    let Some(body @ Value::Dict(body_items)) =
+        proxy_server_request.and_then(|found| get(found, "body"))
+    else {
+        return proxy_server_request.cloned();
     };
     let mut placeholdered = Dict::from_entries(body_items);
     if has(body, "model") {
@@ -276,9 +274,7 @@ fn placeholder_stored_request_body(
     }
     let mut request = Dict::from_entries(request_items);
     request.set("body", placeholdered.into_value());
-    let mut params = Dict::from_entries(entries(litellm_params).unwrap_or_default());
-    params.set("proxy_server_request", request.into_value());
-    params.into_value()
+    Some(request.into_value())
 }
 
 fn router_metadata(
@@ -318,9 +314,10 @@ fn stored_user_email(metadata: &Value) -> Value {
     }
 }
 
-fn duration_ms(start: &Value, end: &Value) -> Value {
-    let parse = |value: &Value| as_str(get_or_none(value, "raw")).and_then(fromisoformat);
-    match (parse(start), parse(end)) {
+/// `request_duration_ms`: whole milliseconds between start and end, when both are naive or both
+/// are aware.
+fn duration_ms(start: &Timestamp, end: &Timestamp) -> Value {
+    match (start.raw, end.raw) {
         (Some(IsoDateTime::Aware(start)), Some(IsoDateTime::Aware(end)))
         | (Some(IsoDateTime::Naive(start)), Some(IsoDateTime::Naive(end))) => {
             int(((end - start) as f64 / 1e6 * 1000.0) as i64)
@@ -329,62 +326,44 @@ fn duration_ms(start: &Value, end: &Value) -> Value {
     }
 }
 
-fn utc(value: &Value) -> Value {
-    get_or_none(value, "utc").clone()
-}
-
+/// The logging payload's attribution fields, read the way `get_logging_payload` falls back to them.
 struct Attribution<'a> {
-    payload: Option<&'a Value>,
+    payload: Option<&'a LoggingPayload>,
 }
 
 impl Attribution<'_> {
     fn fallback(&self, field: &str) -> Value {
-        self.payload.map_or_else(
-            || text(""),
-            |payload| string_or_empty(get_or_none(payload, field)),
-        )
+        self.payload
+            .map_or_else(|| text(""), |payload| string_or_empty(payload.get(field)))
     }
 
     fn payload_get(&self, field: &str) -> &Value {
+        self.payload.map_or(&NONE, |payload| payload.get(field))
+    }
+
+    fn metadata(&self, field: &str) -> &Value {
         self.payload
-            .map_or(&NONE, |payload| get_or_none(payload, field))
+            .map_or(&NONE, |payload| payload.metadata(field))
+    }
+
+    fn hidden(&self, field: &str) -> &Value {
+        self.payload.map_or(&NONE, |payload| payload.hidden(field))
     }
 }
 
-pub(crate) fn build(builder: &SpendLogRowBuilder, input: &Value) -> Result<Value, RowError> {
-    let metadata = required(input, "metadata")?;
-    let kwargs = required(input, "kwargs")?;
-    let litellm_params = required(input, "litellm_params")?;
-    let usage = required(input, "usage")?;
-    let payload = match get_or_none(input, "standard_logging_object") {
-        Value::None => None,
-        found => Some(found),
-    };
+/// `get_logging_payload(kwargs, response_obj, start_time, end_time)`: the whole row.
+pub(crate) fn build(builder: &SpendLogRowBuilder, input: &RowInput) -> Result<Value, RowError> {
+    let config = &builder.config;
+    let metadata = &input.metadata;
+    let kwargs = &input.kwargs;
+    let litellm_params = &input.litellm_params;
+    let usage = &input.usage;
+    let payload = input.payload.as_ref();
     let attribution = Attribution { payload };
-    let payload_metadata = match payload {
-        Some(payload) => Some(
-            get(payload, "metadata")
-                .ok_or(RowError::Missing("standard_logging_object.metadata"))?,
-        ),
-        None => None,
-    };
-    let payload_metadata_get =
-        |key: &str| payload_metadata.map_or(&NONE, |found| get_or_none(found, key));
-    let hidden_params_get =
-        |key: &str| get(attribution.payload_get("hidden_params"), key).unwrap_or(&NONE);
-    let row_input = RowInput {
-        metadata,
-        kwargs,
-        payload,
-        classifier_audit: get_or_none(input, "classifier_audit"),
-    };
-
-    let call_type = get_or_none(input, "call_type");
-    let cache_hit = get_or_none(input, "cache_hit");
-    let rejected_as_unknown_model = is_true(get_or_none(input, "rejected_as_unknown_model"));
+    let rejected_as_unknown_model = input.rejected_as_unknown_model;
 
     let token_count = |field: &str| match payload {
-        Some(payload) => get(payload, field).cloned().unwrap_or_else(|| int(0)),
+        Some(payload) => payload.field(field).cloned().unwrap_or_else(|| int(0)),
         None => int(0),
     };
 
@@ -400,13 +379,13 @@ pub(crate) fn build(builder: &SpendLogRowBuilder, input: &Value) -> Result<Value
     if matches!(api_key, Value::None) {
         api_key = text("");
     }
-    let mut end_user_id = get_or_none(input, "end_user_id").clone();
+    let mut end_user_id = stamps::end_user_id(input, config.disable_end_user_cost_tracking);
     if payload.is_some() {
         if !truthy(&api_key) {
             let from_payload = redact_logged_api_key(
-                payload_metadata_get("user_api_key_hash"),
+                attribution.metadata("user_api_key_hash"),
                 true,
-                payload_metadata_get("user_api_key_alias"),
+                attribution.metadata("user_api_key_alias"),
             );
             api_key = if truthy(&from_payload) {
                 from_payload
@@ -414,8 +393,8 @@ pub(crate) fn build(builder: &SpendLogRowBuilder, input: &Value) -> Result<Value
                 text("")
             };
         }
-        if !builder.config.disable_end_user_cost_tracking && !truthy(&end_user_id) {
-            end_user_id = payload_metadata_get("user_api_key_end_user_id").clone();
+        if !config.disable_end_user_cost_tracking && !truthy(&end_user_id) {
+            end_user_id = attribution.metadata("user_api_key_end_user_id").clone();
         }
     }
     let tags = get(metadata, "tags")
@@ -427,9 +406,9 @@ pub(crate) fn build(builder: &SpendLogRowBuilder, input: &Value) -> Result<Value
         "[]".to_owned()
     };
     if let Some(payload) = payload
-        && !matches!(get_or_none(payload, "request_tags"), Value::None)
+        && !matches!(payload.get("request_tags"), Value::None)
     {
-        request_tags = safe_dumps(get_or_none(payload, "request_tags"), false)?;
+        request_tags = safe_dumps(payload.get("request_tags"), false)?;
     }
 
     let model_info = match get(metadata, "model_info") {
@@ -446,32 +425,24 @@ pub(crate) fn build(builder: &SpendLogRowBuilder, input: &Value) -> Result<Value
         &attribution.fallback("model_group"),
     )
     .clone();
-    let api_base_value = get(litellm_params, "api_base")
-        .cloned()
-        .unwrap_or_else(|| text(""));
+    let api_base_value = litellm_params.api_base.clone().unwrap_or_else(|| text(""));
     let api_base = or(&api_base_value, &attribution.fallback("api_base")).clone();
 
-    let litellm_overhead_time_ms = if payload.is_some() {
-        hidden_params_get("litellm_overhead_time_ms").clone()
-    } else {
-        Value::None
-    };
-    let upstream_provider = match hidden_params_get("upstream_provider") {
+    let litellm_overhead_time_ms = attribution.hidden("litellm_overhead_time_ms").clone();
+    let upstream_provider = match attribution.hidden("upstream_provider") {
         provider @ Value::Str(_) => provider.clone(),
         _ => Value::None,
     };
 
-    let kwargs_provider = get_or_none(kwargs, "custom_llm_provider");
     let fallback_provider = attribution.fallback("custom_llm_provider");
-    let logged_provider = or(kwargs_provider, &fallback_provider);
+    let logged_provider = or(&kwargs.custom_llm_provider, &fallback_provider);
     let logged_provider = if truthy(logged_provider) {
         logged_provider.clone()
     } else {
         Value::None
     };
-    let custom_llm_provider =
-        or(&logged_provider, get_or_none(input, "model_group_provider")).clone();
-    let requested_model = get_or_none(kwargs, "model");
+    let custom_llm_provider = or(&logged_provider, &input.model_group_provider).clone();
+    let requested_model = &kwargs.model;
     let raw_model = as_str(requested_model).unwrap_or_default();
     let model_is_malformed = !matches!(requested_model, Value::None | Value::Str(_));
     let resolved_model = match attribution.payload_get("model") {
@@ -483,7 +454,7 @@ pub(crate) fn build(builder: &SpendLogRowBuilder, input: &Value) -> Result<Value
     let failed_with_prompt_shaped_model = failed
         && !truthy(&model_id)
         && !looks_like_model_name(&resolved_model)
-        && !is_true(get_or_none(input, "is_configured_model_group"));
+        && !input.is_configured_model_group;
     let model_name =
         if rejected_as_unknown_model || failed_with_prompt_shaped_model || model_is_malformed {
             UNKNOWN_MODEL.to_owned()
@@ -512,20 +483,16 @@ pub(crate) fn build(builder: &SpendLogRowBuilder, input: &Value) -> Result<Value
     } else {
         metadata.clone()
     };
-    let litellm_call_id = or(
-        get_or_none(kwargs, "litellm_call_id"),
-        get_or_none(litellm_params, "litellm_call_id"),
-    )
-    .clone();
+    let litellm_call_id = or(&kwargs.litellm_call_id, &litellm_params.litellm_call_id).clone();
 
-    let silent_experiment =
-        payload_metadata.is_some_and(|found| truthy(get_or_none(found, "is_silent_experiment")));
+    let silent_experiment = truthy(attribution.metadata("is_silent_experiment"));
     let guardrail_information = match payload {
-        Some(payload) => get_or_none(payload, "guardrail_information").clone(),
+        Some(payload) => payload.get("guardrail_information").clone(),
         None => get_or_none(metadata, "standard_logging_guardrail_information").clone(),
     };
     let model_map_information = match payload {
-        Some(payload) => get(payload, "model_map_information")
+        Some(payload) => payload
+            .field("model_map_information")
             .ok_or(RowError::Missing(
                 "standard_logging_object.model_map_information",
             ))?
@@ -549,22 +516,13 @@ pub(crate) fn build(builder: &SpendLogRowBuilder, input: &Value) -> Result<Value
     if !matches!(upstream_provider, Value::None) {
         clean.set("upstream_provider", upstream_provider);
     }
-    clean.set(
+    for field in [
         "autorouter_savings",
-        attribution.payload_get("autorouter_savings").clone(),
-    );
-    clean.set(
         "autorouter_savings_estimate",
-        attribution
-            .payload_get("autorouter_savings_estimate")
-            .clone(),
-    );
-    clean.set(
         "autorouter_baseline_observation",
-        attribution
-            .payload_get("autorouter_baseline_observation")
-            .clone(),
-    );
+    ] {
+        clean.set(field, attribution.payload_get(field).clone());
+    }
     clean.set(
         "router_metadata",
         router_metadata(
@@ -575,17 +533,14 @@ pub(crate) fn build(builder: &SpendLogRowBuilder, input: &Value) -> Result<Value
             &litellm_call_id,
         ),
     );
-    clean.set(
-        "azure_spillover",
-        get_or_none(input, "azure_spillover").clone(),
-    );
+    clean.set("azure_spillover", stamps::azure_spillover(input));
     clean.set(
         "used_client_oauth_token",
-        get_or_none(input, "used_client_oauth_token").clone(),
+        stamps::used_client_oauth_token(litellm_params, &custom_llm_provider),
     );
     clean.set(
         "kubernetes_pod_routing",
-        get_or_none(input, "kubernetes_pod_routing").clone(),
+        stamps::kubernetes_pod_routing(litellm_params),
     );
     clean.set(
         "litellm_roi_estimator",
@@ -621,25 +576,23 @@ pub(crate) fn build(builder: &SpendLogRowBuilder, input: &Value) -> Result<Value
     );
     clean.set(
         "applied_guardrails",
-        payload_metadata_get("applied_guardrails").clone(),
+        attribution.metadata("applied_guardrails").clone(),
     );
-    clean.set("batch_models", hidden_params_get("batch_models").clone());
-    clean.set(
+    for field in [
+        "batch_models",
         "batch_successful_requests",
-        hidden_params_get("batch_successful_requests").clone(),
-    );
-    clean.set(
         "batch_failed_requests",
-        hidden_params_get("batch_failed_requests").clone(),
-    );
+    ] {
+        clean.set(field, attribution.hidden(field).clone());
+    }
     clean.set(
         "mcp_tool_call_metadata",
-        payload_metadata_get("mcp_tool_call_metadata").clone(),
+        attribution.metadata("mcp_tool_call_metadata").clone(),
     );
     clean.set(
         "vector_store_request_metadata",
         builder.vector_store_request_metadata(
-            payload_metadata_get("vector_store_request_metadata"),
+            attribution.metadata("vector_store_request_metadata"),
             metadata,
         ),
     );
@@ -647,11 +600,11 @@ pub(crate) fn build(builder: &SpendLogRowBuilder, input: &Value) -> Result<Value
         "guardrail_information",
         builder.sanitize_guardrail_information(&guardrail_information, metadata),
     );
-    clean.set("usage_object", payload_metadata_get("usage_object").clone());
+    clean.set("usage_object", attribution.metadata("usage_object").clone());
     clean.set("model_map_information", model_map_information);
     clean.set(
         "cold_storage_object_key",
-        payload_metadata_get("cold_storage_object_key").clone(),
+        attribution.metadata("cold_storage_object_key").clone(),
     );
     clean.set("litellm_overhead_time_ms", litellm_overhead_time_ms);
     clean.set(
@@ -702,7 +655,7 @@ pub(crate) fn build(builder: &SpendLogRowBuilder, input: &Value) -> Result<Value
         "additional_usage_values",
         additional_usage_values.into_value(),
     );
-    if builder.config.drop_requester_ip_address {
+    if config.drop_requester_ip_address {
         clean.set("requester_ip_address", Value::None);
     }
     let error_information = clean
@@ -713,33 +666,24 @@ pub(crate) fn build(builder: &SpendLogRowBuilder, input: &Value) -> Result<Value
         "error_information",
         builder.sanitize_error_information(
             &error_information,
-            rejected_as_unknown_model.then(|| get_or_none(input, "unknown_model_error_message")),
+            rejected_as_unknown_model.then_some(&input.unknown_model_error_message),
             metadata,
         ),
     );
 
-    let mut request_id = get_or_none(input, "request_id").clone();
-    if is_true(cache_hit) || is_true(get_or_none(input, "served_from_cache")) {
-        let now = match get_or_none(input, "now") {
-            Value::Float(now) => *now,
-            _ => return Err(RowError::Type("now")),
-        };
-        request_id = Value::Str(format!(
-            "{}_cache_hit{}",
-            to_str(&request_id),
-            repr::float_repr(now)
-        ));
-    }
+    let base_request_id = spend_logs_id(input);
+    let request_id = if input.cache_hit == Some(true) || input.served_from_cache {
+        let base = base_request_id.as_deref().unwrap_or("None");
+        Some(format!("{base}_cache_hit{}", repr::float_repr(input.now)))
+    } else {
+        base_request_id
+    };
 
     let mcp_namespaced_tool_name = match clean.get("mcp_tool_call_metadata") {
         Some(Value::None) | None => Value::None,
         Some(found) => dict_get(found, "namespaced_tool_name", "mcp_tool_call_metadata")?.clone(),
     };
-    let agent_id = or(
-        get_or_none(kwargs, "agent_id"),
-        get_or_none(metadata, "agent_id"),
-    )
-    .clone();
+    let agent_id = or(&kwargs.agent_id, get_or_none(metadata, "agent_id")).clone();
     let billing_agent_id = clean
         .get("billing_agent_id")
         .cloned()
@@ -750,60 +694,62 @@ pub(crate) fn build(builder: &SpendLogRowBuilder, input: &Value) -> Result<Value
         .unwrap_or(Value::None);
     let metadata_json = safe_dumps(&clean.into_value(), true)?;
 
-    let stored_params = if model_is_placeholdered {
-        placeholder_stored_request_body(litellm_params, &persisted_model_group, raw_model)
+    let placeholdered_request = model_is_placeholdered
+        .then(|| {
+            placeholder_stored_request(
+                litellm_params.proxy_server_request.as_ref(),
+                &persisted_model_group,
+                raw_model,
+            )
+        })
+        .flatten();
+    let stored_request = if model_is_placeholdered {
+        placeholdered_request.as_ref()
     } else {
-        litellm_params.clone()
+        litellm_params.proxy_server_request.as_ref()
     };
-    let session_id = session_id(builder, input, &row_input, call_type, &request_id);
+    let session_id = session_id(builder, input, request_id.as_deref());
     let status = if failed { "failure" } else { "success" };
-    let start_time = required(input, "start_time")?;
-    let end_time = required(input, "end_time")?;
-    let completion_start_time = match get_or_none(input, "completion_start_time") {
-        Value::None => Value::None,
-        found => utc(found),
+    let completion_start_time = input
+        .completion_start_time
+        .as_ref()
+        .map_or(Value::None, |time| time.utc.clone());
+    let cache_hit = match input.cache_hit {
+        Some(true) => "True",
+        Some(false) => "False",
+        None => "None",
     };
     let field = |name: &str, value: Value| (text(name), value);
+    let text_or_empty = |value: Option<&Value>| or(value.unwrap_or(&text("")), &text("")).clone();
     Ok(Value::Dict(vec![
-        field("request_id", Value::Str(to_str(&request_id))),
-        field("call_type", or(call_type, &text("")).clone()),
-        field("api_key", Value::Str(to_str(&api_key))),
-        field("cache_hit", Value::Str(to_str(cache_hit))),
-        field("startTime", utc(start_time)),
-        field("endTime", utc(end_time)),
-        field("completionStartTime", completion_start_time),
-        field("model", Value::Str(model_name)),
         field(
-            "user",
-            or(
-                &get(metadata, "user_api_key_user_id")
-                    .cloned()
-                    .unwrap_or_else(|| text("")),
-                &text(""),
-            )
-            .clone(),
+            "request_id",
+            Value::Str(request_id.unwrap_or_else(|| "None".to_owned())),
         ),
         field(
+            "call_type",
+            text(input.call_type.as_deref().unwrap_or_default()),
+        ),
+        field("api_key", Value::Str(to_str(&api_key))),
+        field("cache_hit", text(cache_hit)),
+        field("startTime", input.start_time.utc.clone()),
+        field("endTime", input.end_time.utc.clone()),
+        field("completionStartTime", completion_start_time),
+        field("model", Value::Str(model_name)),
+        field("user", text_or_empty(get(metadata, "user_api_key_user_id"))),
+        field(
             "team_id",
-            or(
-                &get(metadata, "user_api_key_team_id")
-                    .cloned()
-                    .unwrap_or_else(|| text("")),
-                &text(""),
-            )
-            .clone(),
+            text_or_empty(get(metadata, "user_api_key_team_id")),
         ),
         field(
             "organization_id",
             or(get_or_none(metadata, "user_api_key_org_id"), &text("")).clone(),
         ),
         field("metadata", Value::Str(metadata_json)),
-        field("cache_key", get_or_none(input, "cache_key").clone()),
+        field("cache_key", input.cache_key.clone()),
         field(
             "spend",
-            get(kwargs, "response_cost")
-                .cloned()
-                .unwrap_or_else(|| int(0)),
+            kwargs.response_cost.clone().unwrap_or_else(|| int(0)),
         ),
         field(
             "total_tokens",
@@ -836,14 +782,17 @@ pub(crate) fn build(builder: &SpendLogRowBuilder, input: &Value) -> Result<Value
             "custom_llm_provider",
             or(&custom_llm_provider, &text("")).clone(),
         ),
-        field("messages", Value::Str(builder.messages_json(&row_input)?)),
-        field("response", Value::Str(builder.response_json(&row_input)?)),
+        field("messages", Value::Str(builder.messages_json(input)?)),
+        field("response", Value::Str(builder.response_json(input)?)),
         field(
             "proxy_server_request",
-            Value::Str(builder.proxy_server_request_json(&row_input, &stored_params)?),
+            Value::Str(builder.proxy_server_request_json(input, stored_request)?),
         ),
         field("session_id", session_id),
-        field("request_duration_ms", duration_ms(start_time, end_time)),
+        field(
+            "request_duration_ms",
+            duration_ms(&input.start_time, &input.end_time),
+        ),
         field("status", text(status)),
         field("litellm_call_id", litellm_call_id),
     ]))
@@ -857,45 +806,39 @@ fn positive(value: &Value) -> bool {
     }
 }
 
-fn session_id(
-    builder: &SpendLogRowBuilder,
-    input: &Value,
-    row_input: &RowInput<'_>,
-    call_type: &Value,
-    request_id: &Value,
-) -> Value {
-    let omit = truthy(get_or_none(
-        row_input.metadata,
-        "litellm_session_id_omitted",
-    )) || builder.config.omit_missing_session_id;
+/// The row's `session_id`: the stamped session when missing sessions are omitted, the batch id
+/// for batch calls, the caller's session under request correlation, else the trace id.
+fn session_id(builder: &SpendLogRowBuilder, input: &RowInput, request_id: Option<&str>) -> Value {
+    let metadata = &input.metadata;
+    let omit = truthy(get_or_none(metadata, "litellm_session_id_omitted"))
+        || builder.config.omit_missing_session_id;
     if omit {
-        let session = get_or_none(row_input.metadata, "session_id");
+        let session = get_or_none(metadata, "session_id");
         return if truthy(session) {
             Value::Str(to_str(session))
         } else {
             Value::None
         };
     }
-    if let (Value::Str(kind), Value::Str(id)) = (call_type, request_id)
-        && BATCH_TRACE_CALL_TYPES.contains(&kind.as_str())
+    if let (Some(kind), Some(id)) = (input.call_type.as_deref(), request_id)
+        && BATCH_TRACE_CALL_TYPES.contains(&kind)
         && !id.is_empty()
     {
         return text(id.strip_suffix(BATCH_COST_REQUEST_ID_SUFFIX).unwrap_or(id));
     }
-    if builder.config.request_correlation_in_logs {
-        let caller = get_or_none(input, "caller_session");
-        if truthy(caller) {
-            return caller.clone();
-        }
+    if builder.config.request_correlation_in_logs
+        && let Some(caller) = stamps::caller_session(input)
+    {
+        return Value::Str(caller);
     }
-    if let Some(payload) = row_input.payload
-        && let Some(trace_id) = get(payload, "trace_id")
+    if let Some(payload) = &input.payload
+        && let Some(trace_id) = payload.field("trace_id")
         && !matches!(trace_id, Value::None)
     {
         return Value::Str(to_str(trace_id));
     }
-    match get_or_none(row_input.kwargs, "litellm_trace_id") {
-        Value::None => get_or_none(input, "fallback_session_id").clone(),
+    match &input.kwargs.litellm_trace_id {
+        Value::None => text(&input.fallback_session_id),
         trace_id => Value::Str(to_str(trace_id)),
     }
 }

@@ -868,7 +868,7 @@ class DBSpendUpdateWriter:
                 if team_id:
                     payload["team_id"] = team_id
             else:
-                from litellm.proxy.spend_tracking.native_spend_log_rows import LedgerRowInput, ledger_spend_log_row
+                from litellm.proxy.spend_tracking.rust_spend_log_rows import LedgerRowInput, ledger_spend_log_row
 
                 ledger_row: Final = ledger_spend_log_row(
                     payload,
