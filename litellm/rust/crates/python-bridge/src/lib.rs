@@ -20,6 +20,7 @@ mod router;
 mod routes;
 mod s3_log;
 mod secrets;
+mod spend_log_rows;
 mod tokenizer;
 
 #[pymodule(gil_used = true)]
@@ -114,6 +115,8 @@ mod _native {
     use crate::routes::traces::trace_encode_error;
     #[pymodule_export]
     use crate::s3_log::NativeS3Log;
+    #[pymodule_export]
+    use crate::spend_log_rows::NativeSpendLogRowBuilder;
     #[cfg(feature = "huggingface")]
     #[pymodule_export]
     use crate::tokenizer::HuggingFaceEncoding;
@@ -169,6 +172,7 @@ mod tests {
                 "ResponsesWebSocketConnection",
                 "NativeDiagnosticProcessor",
                 "NativeTokenRedactor",
+                "NativeSpendLogRowBuilder",
                 "NativeRedisClient",
                 "NativeRedisBreaker",
                 "NativeAdmission",
