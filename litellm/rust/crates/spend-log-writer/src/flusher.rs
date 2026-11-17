@@ -1,3 +1,6 @@
+//! The flusher: statement splitting, poison-row isolation and retries for a batch of
+//! spend logs, as the Python `update_spend_logs` does them.
+
 use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use litellm_db::{Call, Error, Observer, observe};
@@ -18,6 +21,7 @@ const ROW_SEPARATOR_BYTES: usize = 2;
 const TRANSIENT_SQLSTATES: [&str; 5] = ["57P01", "57P02", "57P03", "57P05", "40P01"];
 const REJECTED_ROW_SQLSTATE_CLASSES: [&str; 3] = ["22", "23", "54"];
 
+/// Where a statement's rows are committed: Postgres in production, a fake in tests.
 pub trait LedgerStore: Send + Sync {
     fn insert_with_deliveries(
         &self,
@@ -25,6 +29,7 @@ pub trait LedgerStore: Send + Sync {
     ) -> impl Future<Output = Result<usize, Error>> + Send;
 }
 
+/// A flush that failed, and whether its rows must go back on the queue.
 #[derive(Debug, thiserror::Error)]
 #[error("{source}")]
 pub struct WriteFailure {
@@ -41,6 +46,8 @@ pub enum WriteError {
     Metadata(#[from] crate::statement::InvalidMetadata),
 }
 
+/// Failures worth retrying in the same flush: the database dropped or refused the
+/// connection, is restarting, or picked this statement as a deadlock victim.
 pub fn is_transient(error: &Error) -> bool {
     match error {
         Error::Query(sqlx::Error::Io(_) | sqlx::Error::Tls(_) | sqlx::Error::PoolClosed)
@@ -51,6 +58,7 @@ pub fn is_transient(error: &Error) -> bool {
     }
 }
 
+/// Failures caused by the rows themselves, which isolation narrows to the bad row.
 pub fn is_rejected_row(error: &Error) -> bool {
     match error {
         Error::RejectedSpendLogRow(_) => true,
@@ -64,6 +72,8 @@ fn is_database_failure(error: &Error) -> bool {
     !matches!(error, Error::InvalidSpendLogDelivery(_))
 }
 
+/// Splits rows of the given sizes into statements of at most `max_rows` rows and
+/// `max_bytes` bytes, counting the array framing; a row over the budget goes alone.
 pub fn write_batches(sizes: &[usize], max_bytes: usize, max_rows: usize) -> Vec<(usize, usize)> {
     let mut batches = Vec::new();
     let mut start = 0;
@@ -83,6 +93,9 @@ pub fn write_batches(sizes: &[usize], max_bytes: usize, max_rows: usize) -> Vec<
     batches
 }
 
+/// Writes a batch of rows: chunks of `statement_chunk_rows`, statements within the
+/// byte and row budgets, bisection around rows Postgres rejects, and up to
+/// `write_retries` retries with `1 << attempt` second sleeps on transient failures.
 pub struct SpendLogFlusher<S> {
     store: S,
     observer: Arc<dyn Observer>,
@@ -108,6 +121,8 @@ impl<S: LedgerStore> SpendLogFlusher<S> {
         &self.store
     }
 
+    /// Writes `rows`, retrying transient failures; a failure says whether the rows
+    /// must be requeued.
     pub async fn write(
         &self,
         rows: &[SpendLogRow],

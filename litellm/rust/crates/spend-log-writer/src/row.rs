@@ -1,3 +1,6 @@
+//! A queued request log as the proxy handed it over: an ordered JSON object whose size
+//! is measured the way Python's `json.dumps` writes it.
+
 use litellm_python_compat::{
     Value,
     json::{dumps, loads},
@@ -22,6 +25,8 @@ pub enum RowError {
     NotAnObject,
 }
 
+/// One queued request log, kept in the key order the proxy built it, with its size as
+/// `json.dumps` writes it so the queue budget matches the Python queue's.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SpendLogRow {
     entries: Vec<(String, Value)>,
@@ -84,6 +89,7 @@ impl SpendLogRow {
         matches!(self.get(ACCOUNTING_LOG_DISABLED), Some(Value::Bool(true)))
     }
 
+    /// The row reduced to what charges the request, marked as not logged.
     pub fn accounting_only(&self) -> Self {
         let mut entries: Vec<(String, Value)> = self
             .entries

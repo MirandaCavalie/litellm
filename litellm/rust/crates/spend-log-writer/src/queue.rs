@@ -1,3 +1,6 @@
+//! The byte-bounded spend log queue, which keeps a long database outage from growing
+//! the proxy's memory without bound.
+
 use std::{collections::VecDeque, sync::Mutex};
 
 use crate::SpendLogRow;
@@ -8,11 +11,13 @@ struct State {
     bytes: usize,
 }
 
+/// The in-memory spend log queue, bounded by the bytes its rows dump to.
 #[derive(Debug, Default)]
 pub struct SpendLogQueue {
     state: Mutex<State>,
 }
 
+/// What an enqueue did to the queue.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Enqueued {
     pub dropped: usize,
@@ -39,6 +44,9 @@ impl SpendLogQueue {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// Adds `rows` at the head or the tail, then drops the oldest rows until the queue
+    /// fits `max_bytes`, always keeping the newest row. A dropped row that carries a
+    /// charge comes back as its accounting-only row so the request is still charged.
     pub fn enqueue(&self, rows: Vec<SpendLogRow>, at_head: bool, max_bytes: usize) -> Enqueued {
         let added: usize = rows.iter().map(SpendLogRow::bytes).sum();
         let mut state = self.state();
@@ -62,6 +70,7 @@ impl SpendLogQueue {
         Enqueued { dropped }
     }
 
+    /// Takes up to `limit` rows off the head.
     pub fn dequeue(&self, limit: usize) -> Vec<SpendLogRow> {
         let mut state = self.state();
         let take = limit.min(state.rows.len());

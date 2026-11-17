@@ -1,3 +1,6 @@
+//! Turning queued rows into the ledger transaction's input: metadata retention, the
+//! proxy's JSON clean-up, and parsing each row into a typed `SpendLogRecord`.
+
 use litellm_db::{
     Error, SPEND_LOG_JSON_COLUMNS, SpendLogDelivery, SpendLogLedgerEntry, SpendLogRecord,
 };
@@ -14,6 +17,7 @@ use crate::{
     row::{ACCOUNTING_DELIVERY_ID, ACCOUNTING_LOG_DISABLED, ACCOUNTING_PAYLOAD},
 };
 
+/// Which metadata fields a logged row keeps (`spend_logs_metadata` settings).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Retention {
     pub include: Option<Vec<String>>,
@@ -37,6 +41,7 @@ impl Retention {
 #[error("spend log metadata is not a JSON object")]
 pub struct InvalidMetadata;
 
+/// The row with its metadata cut down to the retained fields.
 pub fn retain_metadata(
     row: &SpendLogRow,
     retention: Option<&Retention>,
@@ -115,6 +120,8 @@ fn accounting_payload(value: &Value) -> Result<Value, Error> {
     }
 }
 
+/// The id a delivery settles under: the row's delivery id, or its request id for a
+/// batch or video job that settles once.
 pub fn delivery_id(row: &SpendLogRow) -> String {
     match row
         .get(ACCOUNTING_DELIVERY_ID)
@@ -125,12 +132,17 @@ pub fn delivery_id(row: &SpendLogRow) -> String {
     }
 }
 
+/// One statement's rows split the way the ledger writes them: logs with no charge,
+/// and deliveries with the logs they bring.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct LedgerRequest {
     pub legacy: Vec<SpendLogRecord>,
     pub ledger: Vec<SpendLogLedgerEntry>,
 }
 
+/// Parses each row at the boundary into the typed records the ledger writes. A row
+/// the table cannot hold fails the statement as a rejected row, so the flusher
+/// isolates it.
 pub fn ledger_request(rows: &[SpendLogRow], max_depth: usize) -> Result<LedgerRequest, Error> {
     let mut request = LedgerRequest::default();
     for row in rows {

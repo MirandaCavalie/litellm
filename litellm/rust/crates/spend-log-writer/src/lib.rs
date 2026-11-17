@@ -1,3 +1,12 @@
+//! The spend log writer: a byte-bounded queue of request logs and the flusher that
+//! commits them to `LiteLLM_SpendLogs` and `LiteLLM_SpendLogDelivery` through the
+//! litellm-db ledger transaction.
+//!
+//! It ports the ledger-on half of the Python proxy's spend log path (`enqueue_spend_logs`,
+//! `ProxyUpdateSpend.update_spend_logs`, `SpendLogsRepository.insert_with_deliveries`):
+//! the same byte budget, statement sizes, poison-row isolation, retries and requeue
+//! rules. The Python proxy still decides when to flush.
+
 mod flusher;
 mod queue;
 mod row;
@@ -19,6 +28,8 @@ pub use row::{RowError, SpendLogRow};
 pub use statement::{InvalidMetadata, LedgerRequest, Retention, ledger_request};
 pub use store::PgLedgerStore;
 
+/// The writer's limits and timings. The defaults are the Python proxy's constants;
+/// the proxy passes the ones it reads from env vars.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WriterSettings {
     pub queue_max_bytes: usize,
@@ -65,6 +76,8 @@ impl WriterSettings {
             .min(self.max_backoff)
     }
 
+    /// The monitor's next wait: back to the base poll once `queued` reaches the
+    /// threshold, otherwise the current wait backed off up to the cap.
     pub fn next_poll_interval(&self, current: Duration, queued: usize) -> Duration {
         if queued >= self.queue_size_threshold {
             self.poll_interval
@@ -74,6 +87,9 @@ impl WriterSettings {
     }
 }
 
+/// The queue and the flusher together, with the lock that keeps one write in flight.
+/// A failed pass puts its rows back at the head of the queue when the failure says
+/// they were not written.
 pub struct SpendLogWriter<S> {
     queue: SpendLogQueue,
     flusher: SpendLogFlusher<S>,
@@ -103,6 +119,7 @@ impl<S: LedgerStore> SpendLogWriter<S> {
         &self.flusher
     }
 
+    /// Queues `rows` within `max_bytes`, logging how many of the oldest rows it dropped.
     pub fn enqueue(&self, rows: Vec<SpendLogRow>, at_head: bool, max_bytes: usize) -> Enqueued {
         let outcome = self.queue.enqueue(rows, at_head, max_bytes);
         if outcome.dropped > 0 {
@@ -138,11 +155,14 @@ impl<S: LedgerStore> SpendLogWriter<S> {
         }
     }
 
+    /// Writes one pass of up to `rows_per_pass` rows from the head of the queue.
     pub async fn flush_pass(&self, retention: Option<&Retention>) -> Result<usize, WriteFailure> {
         let _guard = self.write_lock.lock().await;
         self.flush_pass_locked(retention).await
     }
 
+    /// Writes passes until the queue is empty or `drain_passes` ran out, returning how
+    /// many rows are still queued.
     pub async fn drain(&self, retention: Option<&Retention>) -> Result<usize, WriteFailure> {
         let _guard = self.write_lock.lock().await;
         for _ in 0..self.settings().drain_passes {
@@ -162,6 +182,8 @@ impl<S: LedgerStore> SpendLogWriter<S> {
         Ok(remaining)
     }
 
+    /// The monitor loop: flushes on its poll or when a flush is requested, and backs
+    /// off while the queue is small or writes keep failing.
     pub async fn run(&self, retention: impl Fn() -> Option<Retention>) {
         let settings = self.settings().clone();
         let mut interval = settings.poll_interval;

@@ -1,3 +1,5 @@
+//! The Postgres `LedgerStore`.
+
 use std::time::Duration;
 
 use chrono::Utc;
@@ -5,6 +7,9 @@ use litellm_db::{Error, Pools, insert_spend_log_rows, within, write_spend_log_le
 
 use crate::{LedgerStore, SpendLogRow, ledger_request};
 
+/// Commits statements to Postgres: logs with no charge go in on their own, the rest
+/// through the ledger transaction. A pool timeout with room left in the pool is
+/// reported as an outage, so the flusher retries it.
 #[derive(Clone)]
 pub struct PgLedgerStore {
     pools: Pools,
