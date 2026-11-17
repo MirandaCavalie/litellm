@@ -5,27 +5,23 @@ from collections.abc import Awaitable, Iterator, Mapping, Sequence
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from types import MappingProxyType, TracebackType
-from typing import TYPE_CHECKING, Final
+from typing import Final
 
 from litellm._logging import verbose_proxy_logger
 from litellm.caching.redis_batch import Batch, RequestRedisBatches, active_request_redis_batches
 from litellm.proxy._types import UserAPIKeyAuth
-from litellm.proxy.spend_tracking.native_spend_counters import (
-    post_call_counter_keys as native_post_call_counter_keys,
-)
 from litellm.redis.stores.spend_counters import (
     SpendCounterStore,
     end_user_counter,
     key_counter,
+    model_access_group_counter,
     org_counter,
     project_counter,
+    tag_counter,
     team_counter,
     team_member_counter,
     user_counter,
 )
-
-if TYPE_CHECKING:
-    from litellm.proxy.spend_tracking.budget_reservation import BudgetCounter
 
 _NO_VALUES: Final[Mapping[str, float | None]] = MappingProxyType({})
 
@@ -235,20 +231,23 @@ def post_call_counter_keys(
     tags: Sequence[object] | None,
     model_access_groups: Sequence[object] | None,
     project_id: str | None = None,
-    customer_counters: "Sequence[BudgetCounter]" = (),
 ) -> frozenset[str]:
     """Every counter ``increment_spend_counters`` warm-checks, except budget windows which bind on read."""
-    return native_post_call_counter_keys(
-        token=token,
-        team_id=team_id,
-        user_id=user_id,
-        org_id=org_id,
-        end_user_id=end_user_id,
-        tags=tags,
-        model_access_groups=model_access_groups,
-        project_id=project_id,
-        customer_counters=customer_counters,
+    entity_keys: Final = frozenset(
+        _iter_entity_counter_keys(
+            token=token,
+            team_id=team_id,
+            user_id=user_id,
+            org_id=org_id,
+            project_id=project_id,
+            end_user_id=end_user_id,
+        )
     )
+    tag_keys: Final = frozenset(tag_counter(tag) for tag in tags or () if tag and isinstance(tag, str))
+    group_keys: Final = frozenset(
+        model_access_group_counter(group) for group in model_access_groups or () if group and isinstance(group, str)
+    )
+    return entity_keys | tag_keys | group_keys
 
 
 def bind_admission_counter_keys(token: UserAPIKeyAuth, end_user_id: str | None) -> None:

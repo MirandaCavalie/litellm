@@ -648,6 +648,8 @@ from litellm.proxy.common_utils.user_api_key_cache import (
     budget_windows_absent_cache_key,
     end_user_cache_key,
     get_management_object_ttl,
+    model_access_group_cache_key,
+    project_cache_key,
     tag_cache_key,
 )
 from litellm.proxy.common_utils.validation_error_body import public_validation_errors
@@ -924,8 +926,17 @@ from litellm.redis.stores.spend_counters import (
     SpendCounterStore,
     end_user_counter,
     is_unavailable,
+    key_counter,
+    key_window_counter,
+    model_access_group_counter,
     org_counter,
+    project_counter,
     tag_counter,
+    team_counter,
+    team_member_counter,
+    team_window_counter,
+    user_counter,
+    user_window_counter,
 )
 from litellm.router import router_arguments
 from litellm.router_config import build_router_config
@@ -1015,6 +1026,7 @@ from litellm.proxy.spend_tracking.budget_reservation import (
 from litellm.proxy.spend_tracking.committed_spend import (
     committed_spend_key,
     committed_spend_keys,
+    has_committed_twin,
     is_committed_spend_key,
     seed_committed_spend,
 )
@@ -1030,6 +1042,9 @@ from litellm.proxy.spend_tracking.native_spend_counters import (
 )
 from litellm.proxy.spend_tracking.native_spend_counters import (
     committed_counter_keys as native_committed_counter_keys,
+)
+from litellm.proxy.spend_tracking.native_spend_counters import (
+    post_call_counter_keys as native_post_call_counter_keys,
 )
 from litellm.proxy.spend_tracking.native_spend_counters import (
     window_counter as native_window_counter,
@@ -3758,7 +3773,7 @@ async def increment_spend_counters(
     """
     with spend_counter_batch_scope(
         spend_counter_store,
-        counter_keys=post_call_counter_keys(
+        counter_keys=native_post_call_counter_keys(
             token=token,
             team_id=team_id,
             user_id=user_id,
@@ -3768,7 +3783,19 @@ async def increment_spend_counters(
             model_access_groups=model_access_groups,
             project_id=project_id,
             customer_counters=customer_counters,
-        ),
+        )
+        if windows_from_ledger
+        else post_call_counter_keys(
+            token=token,
+            team_id=team_id,
+            user_id=user_id,
+            org_id=org_id,
+            end_user_id=end_user_id,
+            tags=tags,
+            model_access_groups=model_access_groups,
+            project_id=project_id,
+        )
+        | frozenset(counter.counter_key for counter in customer_counters),
     ):
         await _increment_spend_counters_batched(
             token=token,
@@ -3943,6 +3970,55 @@ async def _increment_spend_counters_batched(
     user_id: str | None,
     response_cost: float | None,
     org_id: str | None,
+    budget_reservation: dict[str, object] | None,
+    end_user_id: str | None,
+    tags: list[str] | None,
+    request_started_at: datetime | None,
+    model_access_groups: Sequence[str] | None,
+    project_id: str | None = None,
+    committed_spend_scope: EntitySpendCounterKeys | None = None,
+    windows_from_ledger: bool = False,
+    customer_counters: Sequence[BudgetCounter] = (),
+) -> None:
+    if not windows_from_ledger:
+        await _increment_spend_counters_legacy(
+            token=token,
+            team_id=team_id,
+            user_id=user_id,
+            response_cost=response_cost,
+            org_id=org_id,
+            budget_reservation=budget_reservation,
+            end_user_id=end_user_id,
+            tags=tags,
+            request_started_at=request_started_at,
+            model_access_groups=model_access_groups,
+            project_id=project_id,
+            committed_spend_scope=committed_spend_scope,
+            customer_counters=customer_counters,
+        )
+        return
+    await _increment_spend_counters_from_plan(
+        token=token,
+        team_id=team_id,
+        user_id=user_id,
+        response_cost=response_cost,
+        org_id=org_id,
+        budget_reservation=budget_reservation,
+        end_user_id=end_user_id,
+        tags=tags,
+        model_access_groups=model_access_groups,
+        project_id=project_id,
+        committed_spend_scope=committed_spend_scope,
+        customer_counters=customer_counters,
+    )
+
+
+async def _increment_spend_counters_legacy(
+    token: str | None,
+    team_id: str | None,
+    user_id: str | None,
+    response_cost: float | None,
+    org_id: str | None,
     budget_reservation: dict | None,
     end_user_id: str | None,
     tags: list[str] | None,
@@ -3956,8 +4032,8 @@ async def _increment_spend_counters_batched(
     """Runs inside one spend counter batch: the reservation reconcile and the warm checks share a single MGET, and
     the reconcile adjustments go out in the same INCRBYFLOAT pipeline as the counter increments."""
     committed_counter_keys: Final = (
-        native_committed_counter_keys(committed_spend_scope.tracked(), response_cost)
-        if committed_spend_scope is not None
+        tuple(counter_key for counter_key in committed_spend_scope.tracked() if has_committed_twin(counter_key))
+        if committed_spend_scope is not None and response_cost is not None and response_cost > 0
         else ()
     )
     bind_spend_counter_keys(frozenset(committed_spend_keys(committed_counter_keys)))
@@ -3975,26 +4051,11 @@ async def _increment_spend_counters_batched(
         return
 
     cost: Final[float] = response_cost
-    plan: Final = plan_spend_counters(
-        token=token,
-        team_id=team_id,
-        user_id=user_id,
-        org_id=org_id,
-        end_user_id=end_user_id,
-        project_id=project_id,
-        tags=tags,
-        model_access_groups=model_access_groups,
-        reserved_counter_keys=reserved_counter_keys,
-        committed_counter_keys=committed_counter_keys,
-        customer_counters=customer_counters,
-    )
 
     async def _resolved_window_increment(
         entity_type: Litellm_EntityType,
         entity_id: str,
         window_counter: str,
-        entity_label: str,
-        reserved: bool,
         duration: str,
         window_start: datetime | None,
         window_reset_at: datetime | str | None,
@@ -4002,13 +4063,17 @@ async def _increment_spend_counters_batched(
         pending_window: Final = (
             await _prepare_window_spend_counter_increment(
                 counter_key=window_counter,
-                entity_type=entity_label,
+                entity_type=(
+                    entity_type.value.capitalize()
+                    if entity_type in (Litellm_EntityType.KEY, Litellm_EntityType.TEAM, Litellm_EntityType.USER)
+                    else entity_type.value
+                ),
                 entity_id=entity_id,
                 window_duration=duration,
                 window_start=window_start,
                 increment=cost,
             )
-            if not reserved
+            if window_counter not in reserved_counter_keys
             else None
         )
         if not windows_from_ledger:
@@ -4033,18 +4098,298 @@ async def _increment_spend_counters_batched(
         window_reset_at: Final = (
             window.get("reset_at") if isinstance(window, dict) else getattr(window, "reset_at", None)
         )
-        counter: Final = native_window_counter(
-            _WINDOWED_ENTITIES[entity_type], entity_id, duration_text, reserved_counter_keys
+        window_counter: Final = (
+            key_window_counter(entity_id, duration_text)
+            if entity_type is Litellm_EntityType.KEY
+            else user_window_counter(entity_id, duration_text)
+            if entity_type is Litellm_EntityType.USER
+            else team_window_counter(entity_id, duration_text)
         )
         return await _resolved_window_increment(
-            entity_type,
+            entity_type, entity_id, window_counter, duration, get_budget_window_start(window), window_reset_at
+        )
+
+    async def _customer_windows() -> tuple[PendingSpendIncrement | BaseException, ...]:
+        pending: Final = await asyncio.gather(
+            *(
+                _resolved_window_increment(
+                    Litellm_EntityType(counter.entity_type),
+                    counter.entity_id,
+                    counter.counter_key,
+                    counter.window_duration,
+                    counter.window_start,
+                    counter.reset_at,
+                )
+                for counter in customer_counters
+                if counter.window_duration is not None
+            ),
+            return_exceptions=True,
+        )
+        return tuple(item for item in pending if item is not None)
+
+    async def _window_increments(
+        entity_type: Litellm_EntityType, entity_id: str, budget_limits: object
+    ) -> tuple[PendingSpendIncrement | BaseException, ...]:
+        if not isinstance(budget_limits, (list, tuple)):
+            return ()
+        window_pending: Final = await asyncio.gather(
+            *(_window_increment(entity_type, entity_id, window) for window in budget_limits), return_exceptions=True
+        )
+        return tuple(item for item in window_pending if item is not None)
+
+    async def _cached_window_increments(
+        entity_type: Litellm_EntityType, entity_id: str, cache_key: str
+    ) -> tuple[_SpendScopeItem, ...]:
+        cached: Final[object] = _UNTYPED_VALUE.validate_python(await user_api_key_cache.async_get_cache(key=cache_key))
+        if cached is None:
+            return (_UncachedBudgetWindows(entity_type=entity_type, entity_id=entity_id),)
+        return await _window_increments(entity_type, entity_id, _cached_budget_limits(cached))
+
+    async def _stored_window_increments(
+        uncached: _UncachedBudgetWindows,
+    ) -> tuple[PendingSpendIncrement | BaseException, ...]:
+        return await _window_increments(
+            uncached.entity_type,
+            uncached.entity_id,
+            await _stored_budget_limits(uncached.entity_type, uncached.entity_id),
+        )
+
+    async def _key_scope(key_token: str) -> tuple[_SpendScopeItem, ...]:
+        # key_token arrives pre-hashed from metadata["user_api_key"] (auth flow
+        # hashes raw "sk-..." keys before they reach the callback). The
+        # startswith("sk-") check is a safety net matching update_cache —
+        # if a raw key somehow arrives, hash it; otherwise use as-is to
+        # avoid double-hashing (budget checks read valid_token.token which
+        # is single-hashed).
+        hashed_token: Final = (
+            hash_token(token=key_token) if isinstance(key_token, str) and key_token.startswith("sk-") else key_token
+        )
+        key_counter_key: Final = key_counter(hashed_token)
+        key_pending: Final[tuple[PendingSpendIncrement, ...]] = (
+            ()
+            if key_counter_key in reserved_counter_keys
+            else (
+                await _prepare_spend_counter_increment(
+                    counter_key=key_counter_key,
+                    source_cache_key=hashed_token,
+                    increment=cost,
+                ),
+            )
+        )
+
+        return key_pending + await _cached_window_increments(Litellm_EntityType.KEY, hashed_token, hashed_token)
+
+    async def _team_scope(scope_team_id: str) -> tuple[_SpendScopeItem, ...]:
+        team_counter_key: Final = team_counter(scope_team_id)
+        team_pending: Final[tuple[PendingSpendIncrement, ...]] = (
+            ()
+            if team_counter_key in reserved_counter_keys
+            else (
+                await _prepare_spend_counter_increment(
+                    counter_key=team_counter_key,
+                    source_cache_key=f"team_id:{scope_team_id}",
+                    increment=cost,
+                ),
+            )
+        )
+
+        return team_pending + await _cached_window_increments(
+            Litellm_EntityType.TEAM, scope_team_id, f"team_id:{scope_team_id}"
+        )
+
+    async def _team_member_scope(
+        scope_user_id: str, scope_team_id: str
+    ) -> tuple[PendingSpendIncrement | BaseException, ...]:
+        team_member_counter_key: Final = team_member_counter(scope_user_id, scope_team_id)
+        if team_member_counter_key in reserved_counter_keys:
+            return ()
+        return (
+            await _prepare_spend_counter_increment(
+                counter_key=team_member_counter_key,
+                source_cache_key=f"team_membership:{scope_user_id}:{scope_team_id}",
+                increment=cost,
+            ),
+        )
+
+    async def _user_scope(scope_user_id: str) -> tuple[_SpendScopeItem, ...]:
+        user_counter_key: Final = user_counter(scope_user_id)
+        pending: Final = (
+            ()
+            if user_counter_key in reserved_counter_keys
+            else (
+                await _prepare_spend_counter_increment(
+                    counter_key=user_counter_key,
+                    source_cache_key=scope_user_id,
+                    increment=cost,
+                ),
+            )
+        )
+        return pending + await _cached_window_increments(Litellm_EntityType.USER, scope_user_id, scope_user_id)
+
+    scope_coros: Final = tuple(
+        coro
+        for coro in (
+            _customer_windows() if customer_counters else None,
+            _key_scope(token) if token is not None else None,
+            _team_scope(team_id) if team_id is not None else None,
+            _team_member_scope(user_id, team_id) if user_id is not None and team_id is not None else None,
+            _user_scope(user_id) if user_id is not None else None,
+            _prepare_end_user_and_tag_spend_increments(
+                end_user_id=end_user_id,
+                tags=tags,
+                response_cost=cost,
+                reserved_counter_keys=reserved_counter_keys,
+            )
+            if end_user_id is not None or tags is not None
+            else None,
+            _prepare_model_access_group_spend_increments(
+                model_access_groups=model_access_groups,
+                response_cost=cost,
+                reserved_counter_keys=reserved_counter_keys,
+            )
+            if model_access_groups
+            else None,
+            _prepare_org_spend_increment(
+                org_id=org_id,
+                response_cost=cost,
+                reserved_counter_keys=reserved_counter_keys,
+            )
+            if org_id is not None
+            else None,
+            _prepare_project_spend_increment(
+                project_id=project_id,
+                response_cost=cost,
+                reserved_counter_keys=reserved_counter_keys,
+            )
+            if project_id is not None
+            else None,
+            _prepare_committed_spend_increments(counter_keys=committed_counter_keys, increment=cost)
+            if committed_counter_keys
+            else None,
+        )
+        if coro is not None
+    )
+
+    # return_exceptions so a failing scope does not leave its siblings running
+    # as orphaned tasks that race the caller's reservation-counter invalidation;
+    # all scopes settle, then the first error propagates as before.
+    scope_items: Final = tuple(_flatten_spend_scopes(await asyncio.gather(*scope_coros, return_exceptions=True)))
+    uncached_windows: Final = tuple(item for item in scope_items if isinstance(item, _UncachedBudgetWindows))
+    await _apply_spend_counter_increments(
+        pending=reservation_update.pending
+        + tuple(item for item in scope_items if isinstance(item, PendingSpendIncrement))
+    )
+    stored_window_items: Final = (
+        tuple(
+            _flatten_spend_scopes(
+                await asyncio.gather(
+                    *(_stored_window_increments(uncached) for uncached in uncached_windows), return_exceptions=True
+                )
+            )
+        )
+        if uncached_windows
+        else ()
+    )
+    stored_window_pending: Final = tuple(
+        item for item in stored_window_items if isinstance(item, PendingSpendIncrement)
+    )
+    if stored_window_pending:
+        await _apply_spend_counter_increments(pending=stored_window_pending)
+    stamp_budget_reservation_actual_cost(budget_reservation=budget_reservation, actual_cost=response_cost)
+    scope_errors: Final = tuple(item for item in scope_items + stored_window_items if isinstance(item, BaseException))
+    if scope_errors:
+        raise scope_errors[0]
+
+    if budget_reservation is not None:
+        budget_reservation["finalized"] = True
+
+
+async def _increment_spend_counters_from_plan(  # noqa: C901  # mirrors the frozen legacy fan-out scope for scope
+    token: str | None,
+    team_id: str | None,
+    user_id: str | None,
+    response_cost: float | None,
+    org_id: str | None,
+    budget_reservation: dict[str, object] | None,
+    end_user_id: str | None,
+    tags: list[str] | None,
+    model_access_groups: Sequence[str] | None,
+    project_id: str | None = None,
+    committed_spend_scope: EntitySpendCounterKeys | None = None,
+    customer_counters: Sequence[BudgetCounter] = (),
+) -> None:
+    committed_counter_keys: Final = (
+        native_committed_counter_keys(committed_spend_scope.tracked(), response_cost)
+        if committed_spend_scope is not None
+        else ()
+    )
+    bind_spend_counter_keys(frozenset(committed_spend_keys(committed_counter_keys)))
+    reservation_update: Final = await _reconcile_budget_reservation_for_counter_update(
+        budget_reservation=budget_reservation,
+        response_cost=response_cost,
+    )
+    reserved_counter_keys: Final = reservation_update.reserved_counter_keys
+
+    if response_cost is None or response_cost == 0:
+        await _apply_spend_counter_increments(pending=reservation_update.pending)
+        stamp_budget_reservation_actual_cost(budget_reservation=budget_reservation, actual_cost=response_cost)
+        if budget_reservation is not None:
+            budget_reservation["finalized"] = True  # rebind-ok: the caller reads finalized off its shared reservation
+        return
+
+    cost: Final[float] = response_cost
+    plan: Final = plan_spend_counters(
+        token=token,
+        team_id=team_id,
+        user_id=user_id,
+        org_id=org_id,
+        end_user_id=end_user_id,
+        project_id=project_id,
+        tags=tags,
+        model_access_groups=model_access_groups,
+        reserved_counter_keys=reserved_counter_keys,
+        committed_counter_keys=committed_counter_keys,
+        customer_counters=customer_counters,
+    )
+
+    async def _resolved_window_increment(
+        entity_id: str,
+        window_counter: str,
+        entity_label: str,
+        reserved: bool,
+        duration: str,
+        window_start: datetime | None,
+    ) -> PendingSpendIncrement | None:
+        if reserved:
+            return None
+        return await _prepare_window_spend_counter_increment(
+            counter_key=window_counter,
+            entity_type=entity_label,
+            entity_id=entity_id,
+            window_duration=duration,
+            window_start=window_start,
+            increment=cost,
+        )
+
+    async def _window_increment(
+        entity_type: Litellm_EntityType, entity_id: str, window: object
+    ) -> PendingSpendIncrement | None:
+        fields: Final = as_str_mapping(window) if _is_dict(window) else None
+        duration: Final = TypeAdapter(str).validate_python(
+            fields["budget_duration"]
+            if fields is not None
+            else _UNTYPED_VALUE.validate_python(getattr(window, "budget_duration", None))
+        )
+        counter: Final = native_window_counter(
+            _WINDOWED_ENTITIES[entity_type], entity_id, duration, reserved_counter_keys
+        )
+        return await _resolved_window_increment(
             entity_id,
             counter.counter_key,
             counter.entity_label,
             counter.reserved,
             duration,
             get_budget_window_start(window),
-            window_reset_at,
         )
 
     async def _customer_window(
@@ -4052,14 +4397,12 @@ async def _increment_spend_counters_batched(
     ) -> tuple[PendingSpendIncrement, ...]:
         counter: Final = customer_counters[task.index]
         pending_window: Final = await _resolved_window_increment(
-            entity_type,
             counter.entity_id,
             task.counter_key,
             task.entity_label,
             task.reserved,
             counter.window_duration or "",
             counter.window_start,
-            counter.reset_at,
         )
         return () if pending_window is None else (pending_window,)
 
@@ -4069,7 +4412,11 @@ async def _increment_spend_counters_batched(
         if not isinstance(budget_limits, (list, tuple)):
             return ()
         window_pending: Final = await asyncio.gather(
-            *(_window_increment(entity_type, entity_id, window) for window in budget_limits), return_exceptions=True
+            *(
+                _window_increment(entity_type, entity_id, window)
+                for window in _BUDGET_WINDOWS.validate_python(budget_limits)
+            ),
+            return_exceptions=True,
         )
         return tuple(item for item in window_pending if item is not None)
 
@@ -4149,7 +4496,14 @@ async def _increment_spend_counters_batched(
         raise scope_errors[0]
 
     if budget_reservation is not None:
-        budget_reservation["finalized"] = True
+        budget_reservation["finalized"] = True  # rebind-ok: the caller reads finalized off its shared reservation
+
+
+_BUDGET_WINDOWS: Final = TypeAdapter(tuple[object, ...])
+
+
+def _is_dict(value: object) -> bool:
+    return isinstance(value, dict)
 
 
 _WINDOWED_ENTITIES: Final[Mapping[Litellm_EntityType, WindowedEntity]] = MappingProxyType(
@@ -4276,6 +4630,39 @@ async def _prepare_end_user_and_tag_spend_increments(
     return tuple(item for item in results if item is not None)
 
 
+async def _prepare_model_access_group_spend_increments(
+    model_access_groups: Sequence[object],
+    response_cost: float,
+    reserved_counter_keys: set[str],
+) -> tuple[PendingSpendIncrement | BaseException, ...]:
+    """Charge the model access groups that authorized this request.
+
+    Without this the counter auth reads is written only by the reservation path, so
+    ``disable_budget_reservation`` would leave ``_model_access_group_max_budget_check`` enforcing
+    against the DB row's spend, which lags by up to the cache TTL.
+
+    Typed ``object`` rather than ``str`` because the names reach the cost callback out of request
+    metadata, which the coercion upstream filters to a list but not to strings. A non-string that
+    slipped through would build a counter key nothing else ever reads.
+    """
+    unique_groups: Final = tuple(
+        dict.fromkeys(group for group in model_access_groups if group and isinstance(group, str))
+    )
+    results: Final = await asyncio.gather(
+        *(
+            _prepare_unreserved_spend_counter_increment(
+                counter_key=model_access_group_counter(group),
+                source_cache_key=model_access_group_cache_key(group),
+                increment=response_cost,
+                reserved_counter_keys=reserved_counter_keys,
+            )
+            for group in unique_groups
+        ),
+        return_exceptions=True,
+    )
+    return tuple(item for item in results if item is not None)
+
+
 async def _prepare_org_spend_increment(
     org_id: str | None,
     response_cost: float,
@@ -4287,6 +4674,23 @@ async def _prepare_org_spend_increment(
     pending: Final = await _prepare_unreserved_spend_counter_increment(
         counter_key=org_counter(org_id),
         source_cache_key=[f"org_id:{org_id}:with_budget", f"org_id:{org_id}"],
+        increment=response_cost,
+        reserved_counter_keys=reserved_counter_keys,
+    )
+    return (pending,) if pending is not None else ()
+
+
+async def _prepare_project_spend_increment(
+    project_id: str | None,
+    response_cost: float,
+    reserved_counter_keys: set[str],
+) -> tuple[PendingSpendIncrement, ...]:
+    if project_id is None:
+        return ()
+
+    pending: Final = await _prepare_unreserved_spend_counter_increment(
+        counter_key=project_counter(project_id),
+        source_cache_key=project_cache_key(project_id),
         increment=response_cost,
         reserved_counter_keys=reserved_counter_keys,
     )
