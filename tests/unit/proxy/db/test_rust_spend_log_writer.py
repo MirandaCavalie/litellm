@@ -8,10 +8,10 @@ import pytest
 import pytest_asyncio
 
 from litellm.proxy.db.native_database import ServiceLoggingEvents, native_endpoint
-from litellm.proxy.db.native_spend_log_writer import (
-    install_native_spend_log_writer,
-    native_spend_log_writer,
-    uninstall_native_spend_log_writer,
+from litellm.proxy.db.rust_spend_log_writer import (
+    install_rust_spend_log_writer,
+    rust_spend_log_writer,
+    uninstall_rust_spend_log_writer,
 )
 from litellm.proxy.db.spend_log_batching import spend_log_row_bytes
 from litellm.proxy.utils import (
@@ -22,7 +22,7 @@ from litellm.proxy.utils import (
     enqueue_spend_logs,
     update_spend,
 )
-from litellm.rust_bridge._native import NativeDatabase, NativeSpendLogWriteFailure, NativeSpendLogWriter
+from litellm.rust_bridge._native import NativeDatabase, RustSpendLogWriteFailure, RustSpendLogWriter
 
 _UNREACHABLE: Final = "postgresql://litellm:secret@db.invalid:5432/proxy?pool_timeout=1"
 _REFUSED: Final = "postgresql://litellm:secret@127.0.0.1:1/proxy?pool_timeout=1"
@@ -80,12 +80,12 @@ def _python_queue_bytes(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest_asyncio.fixture
-async def installed() -> AsyncIterator[tuple[FakePrismaClient, NativeSpendLogWriter]]:
+async def installed() -> AsyncIterator[tuple[FakePrismaClient, RustSpendLogWriter]]:
     client: Final = FakePrismaClient()
-    writer: Final = await install_native_spend_log_writer(client, await _unreachable_database(), _LEDGER_ON, None)
+    writer: Final = await install_rust_spend_log_writer(client, await _unreachable_database(), _LEDGER_ON, None)
     assert writer is not None
     yield client, writer
-    uninstall_native_spend_log_writer(client)
+    uninstall_rust_spend_log_writer(client)
 
 
 def _request_ids(rows: Sequence[Mapping[str, object]]) -> Sequence[object]:
@@ -93,8 +93,8 @@ def _request_ids(rows: Sequence[Mapping[str, object]]) -> Sequence[object]:
 
 
 @pytest.mark.asyncio
-async def test_native_queue_keeps_the_python_queue_order(
-    installed: tuple[FakePrismaClient, NativeSpendLogWriter],
+async def test_rust_queue_keeps_the_python_queue_order(
+    installed: tuple[FakePrismaClient, RustSpendLogWriter],
 ) -> None:
     client, writer = installed
 
@@ -119,8 +119,8 @@ async def test_native_queue_keeps_the_python_queue_order(
         _row("charged", accounting_payload={"spend": 1.5, "nested": {"a": [1, {"b": "c"}]}}),
     ],
 )
-async def test_native_queue_measures_rows_like_the_python_queue(
-    installed: tuple[FakePrismaClient, NativeSpendLogWriter], row: Mapping[str, object]
+async def test_rust_queue_measures_rows_like_the_python_queue(
+    installed: tuple[FakePrismaClient, RustSpendLogWriter], row: Mapping[str, object]
 ) -> None:
     client, writer = installed
 
@@ -132,7 +132,7 @@ async def test_native_queue_measures_rows_like_the_python_queue(
 
 @pytest.mark.asyncio
 async def test_overflow_drops_the_same_rows_and_keeps_the_same_charges_as_the_python_queue(
-    installed: tuple[FakePrismaClient, NativeSpendLogWriter],
+    installed: tuple[FakePrismaClient, RustSpendLogWriter],
 ) -> None:
     client, _ = installed
     python_client: Final = FakePrismaClient()
@@ -146,27 +146,27 @@ async def test_overflow_drops_the_same_rows_and_keeps_the_same_charges_as_the_py
         await enqueue_spend_logs(client, [row], max_bytes=budget)
         await enqueue_spend_logs(python_client, [row], max_bytes=budget)
 
-    native_rows: Final = await dequeue_spend_logs(client, 100)
-    assert any(row.get("accounting_log_disabled") is True for row in native_rows)
-    assert native_rows == python_client.spend_log_transactions
+    rust_rows: Final = await dequeue_spend_logs(client, 100)
+    assert any(row.get("accounting_log_disabled") is True for row in rust_rows)
+    assert rust_rows == python_client.spend_log_transactions
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("url", [_UNREACHABLE, _REFUSED], ids=["unresolvable_host", "refused_connect"])
 async def test_an_outage_is_retried_three_times_then_requeued_at_the_head(url: str) -> None:
     client: Final = FakePrismaClient()
-    writer: Final = await install_native_spend_log_writer(client, await _unreachable_database(url), _LEDGER_ON, None)
+    writer: Final = await install_rust_spend_log_writer(client, await _unreachable_database(url), _LEDGER_ON, None)
     proxy_logging_obj: Final = _proxy_logging()
     rows: Final = [_row("a", accounting_payload={"spend": 1.5}), _row("b")]
     await enqueue_spend_logs(client, rows)
     started: Final = time.monotonic()
 
-    with pytest.raises(NativeSpendLogWriteFailure) as failure:
+    with pytest.raises(RustSpendLogWriteFailure) as failure:
         await update_spend(client, None, proxy_logging_obj)
     elapsed: Final = time.monotonic() - started
     await asyncio.sleep(0)
     requeued: Final = await dequeue_spend_logs(client, 10)
-    uninstall_native_spend_log_writer(client)
+    uninstall_rust_spend_log_writer(client)
 
     assert writer is not None
     assert failure.value.requeue is True
@@ -177,8 +177,8 @@ async def test_an_outage_is_retried_three_times_then_requeued_at_the_head(url: s
 
 
 @pytest.mark.asyncio
-async def test_a_row_the_native_writer_cannot_encode_is_dropped_and_keeps_its_charge(
-    installed: tuple[FakePrismaClient, NativeSpendLogWriter],
+async def test_a_row_the_rust_writer_cannot_encode_is_dropped_and_keeps_its_charge(
+    installed: tuple[FakePrismaClient, RustSpendLogWriter],
 ) -> None:
     client, _ = installed
     unencodable: Final = _row("lone", messages="\ud800", accounting_payload={"spend": 2.0}, call_type="acompletion")
@@ -199,12 +199,12 @@ async def test_the_python_queue_stays_when_the_ledger_is_off_or_spend_logs_are_e
     client: Final = FakePrismaClient()
     await enqueue_spend_logs(client, [_row("a")])
 
-    writer: Final = await install_native_spend_log_writer(
+    writer: Final = await install_rust_spend_log_writer(
         client, await _unreachable_database(), general_settings, spend_logs_url
     )
 
     assert writer is None
-    assert native_spend_log_writer(client) is None
+    assert rust_spend_log_writer(client) is None
     assert client.spend_log_transactions == [_row("a")]
 
 
@@ -213,13 +213,13 @@ async def test_installing_moves_rows_already_queued_in_python_ahead_of_new_rows(
     client: Final = FakePrismaClient()
     await enqueue_spend_logs(client, [_row("early"), _row("earlier", accounting_payload={"spend": 1.0})])
 
-    writer: Final = await install_native_spend_log_writer(client, await _unreachable_database(), {}, None)
+    writer: Final = await install_rust_spend_log_writer(client, await _unreachable_database(), {}, None)
     await enqueue_spend_logs(client, [_row("late")])
 
     assert writer is not None
     assert client.spend_log_transactions == []
     assert PrismaClient.spend_log_queue_bytes == 0
     assert _request_ids(await dequeue_spend_logs(client, 10)) == ["early", "earlier", "late"]
-    uninstall_native_spend_log_writer(client)
-    assert native_spend_log_writer(client) is None
+    uninstall_rust_spend_log_writer(client)
+    assert rust_spend_log_writer(client) is None
     assert writer.queued_bytes == 0

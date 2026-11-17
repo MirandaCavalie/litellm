@@ -704,12 +704,12 @@ class NativeDatabase:
     def health_check(self) -> Future[None]: ...
     def close(self) -> Future[None]: ...
 
-class NativeSpendLogWriteFailure(Exception):
+class RustSpendLogWriteFailure(Exception):
     requeue: bool
     kind: str
 
 @final
-class NativeSpendLogWriter:
+class RustSpendLogWriter:
     def __new__(
         cls,
         database: NativeDatabase,
@@ -721,7 +721,7 @@ class NativeSpendLogWriter:
         poll_interval_seconds: float,
         max_backoff_seconds: float,
         max_depth: int,
-    ) -> NativeSpendLogWriter: ...
+    ) -> RustSpendLogWriter: ...
     def enqueue(self, rows: Sequence[str], at_head: bool, max_bytes: int) -> tuple[int, list[int]]: ...
     def dequeue(self, limit: int) -> list[str]: ...
     def __len__(self) -> int: ...
@@ -957,8 +957,6 @@ __all__ = [
     "NativeSend",
     "NativeSensitiveRoutePins",
     "NativeSpendCounters",
-    "NativeSpendLogWriteFailure",
-    "NativeSpendLogWriter",
     "NativeTableSwapped",
     "NativeTokenRedactor",
     "NativeUsageRead",
@@ -972,6 +970,8 @@ __all__ = [
     "RustBridgeDeclined",
     "RustDenial",
     "RustPlan",
+    "RustSpendLogWriteFailure",
+    "RustSpendLogWriter",
     "RustUpstreamError",
     "SpendRead",
     "TokenCounter",

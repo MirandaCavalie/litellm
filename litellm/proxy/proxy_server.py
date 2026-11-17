@@ -1631,23 +1631,21 @@ async def _own_database(resources: AsyncExitStack, client: PrismaClient | None) 
     return database
 
 
-async def _install_native_spend_log_writer(
-    resources: AsyncExitStack, database: database_runtime.Database | None
-) -> None:
+async def _install_rust_spend_log_writer(resources: AsyncExitStack, database: database_runtime.Database | None) -> None:
     if database is None or database.native is None:
         return
-    from litellm.proxy.db.native_spend_log_writer import (
-        install_native_spend_log_writer,
-        uninstall_native_spend_log_writer,
+    from litellm.proxy.db.rust_spend_log_writer import (
+        install_rust_spend_log_writer,
+        uninstall_rust_spend_log_writer,
     )
 
     if (
-        await install_native_spend_log_writer(
+        await install_rust_spend_log_writer(
             database.prisma, database.native, general_settings_view(), os.getenv("SPEND_LOGS_URL")
         )
         is not None
     ):
-        resources.callback(uninstall_native_spend_log_writer, database.prisma)
+        resources.callback(uninstall_rust_spend_log_writer, database.prisma)
 
 
 def _forget_prisma_client() -> None:
@@ -1796,7 +1794,7 @@ async def _proxy_lifespan(app: FastAPI, resources: AsyncExitStack) -> AsyncGener
         )
 
     database: Final = existing_database or await _own_database(resources, prisma_client)
-    await _install_native_spend_log_writer(resources, database)
+    await _install_rust_spend_log_writer(resources, database)
 
     await migrate_if_requested(
         environ=os.environ,

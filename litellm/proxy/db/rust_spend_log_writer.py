@@ -19,7 +19,7 @@ from litellm.constants import (
 )
 from litellm.litellm_core_utils.safe_json_dumps import safe_dumps
 from litellm.proxy.spend_tracking.spend_log_error_logger import spend_log_error
-from litellm.rust_bridge._native import NativeDatabase, NativeSpendLogWriteFailure, NativeSpendLogWriter
+from litellm.rust_bridge._native import NativeDatabase, RustSpendLogWriteFailure, RustSpendLogWriter
 
 if TYPE_CHECKING:
     from litellm.proxy.utils import PrismaClient, ProxyLogging
@@ -30,22 +30,22 @@ _ROWS: Final = TypeAdapter(dict[str, object])
 @dataclass(frozen=True, slots=True)
 class _Installed:
     client: object
-    writer: NativeSpendLogWriter
+    writer: RustSpendLogWriter
 
 
 _installed: Final[list[_Installed]] = []  # mutable-ok: registry rewritten in place by install and uninstall
 
 
-def native_spend_log_writer(prisma_client: object) -> NativeSpendLogWriter | None:
+def rust_spend_log_writer(prisma_client: object) -> RustSpendLogWriter | None:
     return next((installed.writer for installed in _installed if installed.client is prisma_client), None)
 
 
-def native_spend_log_queue_size(prisma_client: object) -> int:
-    writer: Final = native_spend_log_writer(prisma_client)
+def rust_spend_log_queue_size(prisma_client: object) -> int:
+    writer: Final = rust_spend_log_writer(prisma_client)
     return 0 if writer is None else len(writer)
 
 
-def spend_log_writer_runs_natively(general_settings: Mapping[str, object], spend_logs_url: str | None) -> bool:
+def spend_log_writer_runs_in_rust(general_settings: Mapping[str, object], spend_logs_url: str | None) -> bool:
     return general_settings.get("use_spend_logs_ledger", True) is not False and spend_logs_url is None
 
 
@@ -57,13 +57,13 @@ def _encoded(row: Mapping[str, object]) -> str:
 
 
 def _enqueue_rows(
-    writer: NativeSpendLogWriter, rows: Sequence[Mapping[str, object]], at_head: bool, max_bytes: int
+    writer: RustSpendLogWriter, rows: Sequence[Mapping[str, object]], at_head: bool, max_bytes: int
 ) -> tuple[int, Sequence[int]]:
     return writer.enqueue([_encoded(row) for row in rows], at_head, max_bytes)
 
 
-def enqueue_natively(
-    writer: NativeSpendLogWriter,
+def enqueue_in_rust(
+    writer: RustSpendLogWriter,
     logs: Sequence[Mapping[str, object]],
     *,
     at_head: bool,
@@ -76,7 +76,7 @@ def enqueue_natively(
         spend_log_error(
             "Spend tracking - dropping spend log row Postgres rejected. request_id=%s error=%s",
             logs[index].get("request_id"),
-            "the row holds text the native writer cannot encode",
+            "the row holds text the Rust writer cannot encode",
         )
     charged: Final = tuple(
         accounting_only_spend_log(logs[index]) for index in refused if "accounting_payload" in logs[index]
@@ -86,7 +86,7 @@ def enqueue_natively(
         spend_log_error(
             "Spend tracking - could not keep the charges of %d dropped spend log rows. error=%s",
             len(unkept),
-            "the charge holds text the native writer cannot encode",
+            "the charge holds text the Rust writer cannot encode",
         )
     if dropped + rescue_dropped > 0:
         verbose_proxy_logger.error(
@@ -96,8 +96,8 @@ def enqueue_natively(
         )
 
 
-def dequeue_natively(
-    writer: NativeSpendLogWriter, limit: int
+def dequeue_from_rust(
+    writer: RustSpendLogWriter, limit: int
 ) -> list[dict[str, object]]:  # mutable-ok: dequeue_spend_logs hands callers the rows the Python queue would
     return [_ROWS.validate_python(json.loads(text)) for text in writer.dequeue(limit)]
 
@@ -112,8 +112,8 @@ def _retention() -> tuple[tuple[str, ...] | None, tuple[str, ...] | None, tuple[
     return fields.include, fields.exclude, tuple(sorted(SPEND_LOGS_METADATA_ALWAYS_KEPT_FIELDS))
 
 
-async def write_natively(
-    writer: NativeSpendLogWriter,
+async def write_in_rust(
+    writer: RustSpendLogWriter,
     prisma_client: "PrismaClient",
     proxy_logging_obj: "ProxyLogging",
     logs: Sequence[Mapping[str, object]],
@@ -123,7 +123,7 @@ async def write_natively(
     start_time: Final = time.time()
     try:
         await writer.write([_encoded(row) for row in logs], _retention())
-    except NativeSpendLogWriteFailure as e:
+    except RustSpendLogWriteFailure as e:
         if e.kind == "invalid_metadata":
             raise
         if e.requeue:
@@ -131,15 +131,15 @@ async def write_natively(
         raise_failed_update_spend_exception(e=e, start_time=start_time, proxy_logging_obj=proxy_logging_obj)
 
 
-async def install_native_spend_log_writer(
+async def install_rust_spend_log_writer(
     prisma_client: "PrismaClient",
     database: NativeDatabase,
     general_settings: Mapping[str, object],
     spend_logs_url: str | None,
-) -> NativeSpendLogWriter | None:
-    if not spend_log_writer_runs_natively(general_settings, spend_logs_url):
+) -> RustSpendLogWriter | None:
+    if not spend_log_writer_runs_in_rust(general_settings, spend_logs_url):
         return None
-    writer: Final = NativeSpendLogWriter(
+    writer: Final = RustSpendLogWriter(
         database,
         queue_max_bytes=SPEND_LOG_QUEUE_MAX_BYTES,
         write_batch_max_bytes=SPEND_LOG_WRITE_BATCH_MAX_BYTES,
@@ -151,13 +151,13 @@ async def install_native_spend_log_writer(
     )
     from litellm.proxy.utils import dequeue_spend_logs
 
-    uninstall_native_spend_log_writer(prisma_client)
+    uninstall_rust_spend_log_writer(prisma_client)
     pending: Final = await dequeue_spend_logs(prisma_client, sys.maxsize)
     _installed.append(_Installed(client=prisma_client, writer=writer))
     if pending:
-        enqueue_natively(writer, pending, at_head=True, max_bytes=SPEND_LOG_QUEUE_MAX_BYTES)
+        enqueue_in_rust(writer, pending, at_head=True, max_bytes=SPEND_LOG_QUEUE_MAX_BYTES)
     return writer
 
 
-def uninstall_native_spend_log_writer(prisma_client: object) -> None:
+def uninstall_rust_spend_log_writer(prisma_client: object) -> None:
     _installed[:] = [installed for installed in _installed if installed.client is not prisma_client]

@@ -268,19 +268,19 @@ from litellm.proxy.db.log_db_metrics import (  # noqa: F401, RUF100  # legacy mo
     is_exception_related_to_db,
     log_db_metrics,
 )
-from litellm.proxy.db.native_spend_log_writer import (
-    dequeue_natively,
-    enqueue_natively,
-    native_spend_log_queue_size,
-    native_spend_log_writer,
-    write_natively,
-)
 from litellm.proxy.db.pgbouncer import database_url_is_pooled
 from litellm.proxy.db.prisma_client import (
     PrismaWrapper,
     parse_iam_endpoint_from_url,
 )
 from litellm.proxy.db.routing_prisma_wrapper import RoutingPrismaWrapper
+from litellm.proxy.db.rust_spend_log_writer import (
+    dequeue_from_rust,
+    enqueue_in_rust,
+    rust_spend_log_queue_size,
+    rust_spend_log_writer,
+    write_in_rust,
+)
 from litellm.proxy.db.spend_log_batching import (
     spend_log_queue_within_budget,
     spend_log_row_bytes,
@@ -9018,8 +9018,8 @@ async def enqueue_spend_logs(
     dropped, which keeps a long outage from growing the queue until the pod
     dies.
     """
-    if (native_writer := native_spend_log_writer(prisma_client)) is not None:
-        enqueue_natively(native_writer, logs, at_head=at_head, max_bytes=max_bytes)
+    if (rust_writer := rust_spend_log_writer(prisma_client)) is not None:
+        enqueue_in_rust(rust_writer, logs, at_head=at_head, max_bytes=max_bytes)
         return
     added: Final = sum(spend_log_row_bytes(row) for row in logs)
     async with prisma_client._spend_log_transactions_lock:
@@ -9072,8 +9072,8 @@ async def dequeue_spend_logs(prisma_client: PrismaClient, limit: int) -> list[di
     Every enqueue and dequeue goes through this pair so the byte total the
     queue is bounded by stays in step with what the queue actually holds.
     """
-    if (native_writer := native_spend_log_writer(prisma_client)) is not None:
-        return dequeue_natively(native_writer, limit)
+    if (rust_writer := rust_spend_log_writer(prisma_client)) is not None:
+        return dequeue_from_rust(rust_writer, limit)
     async with prisma_client._spend_log_transactions_lock:
         popped: Final = prisma_client.spend_log_transactions[:limit]
         prisma_client.spend_log_transactions[:] = prisma_client.spend_log_transactions[limit:]
@@ -9149,8 +9149,8 @@ class ProxyUpdateSpend:
             if logs_to_process is not None
             else await dequeue_spend_logs(prisma_client, MAX_LOGS_PER_INTERVAL)
         )
-        if (native_writer := native_spend_log_writer(prisma_client)) is not None:
-            await write_natively(native_writer, prisma_client, proxy_logging_obj, logs_to_process)
+        if (rust_writer := rust_spend_log_writer(prisma_client)) is not None:
+            await write_in_rust(rust_writer, prisma_client, proxy_logging_obj, logs_to_process)
             return
         if len(logs_to_process) > 0:
             verbose_proxy_logger.info(
@@ -9400,7 +9400,7 @@ async def _total_queued_spend_transactions(prisma_client: PrismaClient) -> int:
         baseline_queue_size: Final = len(prisma_client.baseline_accounting_transactions)
     return (
         spend_queue_size
-        + native_spend_log_queue_size(prisma_client)
+        + rust_spend_log_queue_size(prisma_client)
         + tool_queue_size
         + model_usage_queue_size
         + autorouter_queue_size

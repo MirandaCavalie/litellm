@@ -116,7 +116,7 @@ mod _native {
     #[pymodule_export]
     use crate::s3_log::NativeS3Log;
     #[pymodule_export]
-    use crate::spend_log_writer::{NativeSpendLogWriteFailure, NativeSpendLogWriter};
+    use crate::spend_log_writer::{RustSpendLogWriteFailure, RustSpendLogWriter};
     #[cfg(feature = "huggingface")]
     #[pymodule_export]
     use crate::tokenizer::HuggingFaceEncoding;
@@ -227,8 +227,8 @@ mod tests {
                 "NativeBudgets",
                 "budget_check_decision",
                 "NativeS3Log",
-                "NativeSpendLogWriter",
-                "NativeSpendLogWriteFailure",
+                "RustSpendLogWriter",
+                "RustSpendLogWriteFailure",
                 "auth_allowed_routes_grant",
                 "auth_first_denied_route",
                 "auth_jwt_team_routes_grant",

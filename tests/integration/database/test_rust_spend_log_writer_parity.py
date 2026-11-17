@@ -14,7 +14,7 @@ from psycopg.rows import dict_row
 from pydantic import JsonValue, TypeAdapter
 
 from litellm.proxy.db.native_database import ServiceLoggingEvents, native_endpoint
-from litellm.proxy.db.native_spend_log_writer import install_native_spend_log_writer, uninstall_native_spend_log_writer
+from litellm.proxy.db.rust_spend_log_writer import install_rust_spend_log_writer, uninstall_rust_spend_log_writer
 from litellm.proxy.utils import PrismaClient, ProxyUpdateSpend, enqueue_spend_logs, jsonify_object
 from litellm.rust_bridge._native import NativeDatabase
 
@@ -177,32 +177,32 @@ async def _flush(client: FakePrismaClient, rows: Sequence[Mapping[str, object]])
 
 
 @pytest.mark.asyncio
-async def test_the_native_writer_stores_what_the_python_writer_stores(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_the_rust_writer_stores_what_the_python_writer_stores(monkeypatch: pytest.MonkeyPatch) -> None:
     url: Final = _database_url()
     monkeypatch.delenv("SPEND_LOGS_URL", raising=False)
     monkeypatch.setattr(PrismaClient, "spend_log_queue_bytes", 0)
-    prefix: Final = f"native-writer-{uuid.uuid4().hex}"
+    prefix: Final = f"rust-writer-{uuid.uuid4().hex}"
 
     python_client: Final = FakePrismaClient(url)
     await _flush(python_client, _rows(prefix))
     await _flush(python_client, _rows(prefix))
     python_stored: Final = await _stored(url, prefix)
 
-    native_client: Final = FakePrismaClient(url)
+    rust_client: Final = FakePrismaClient(url)
     database: Final = await NativeDatabase.connect(
         ServiceLoggingEvents(loop=asyncio.get_running_loop(), service_logging=lambda: None),
         native_endpoint(url, tls_offered=False, max_connections=2).endpoint,
         None,
     )
-    writer: Final = await install_native_spend_log_writer(native_client, database, {}, None)
+    writer: Final = await install_rust_spend_log_writer(rust_client, database, {}, None)
     try:
-        await _flush(native_client, _rows(prefix))
-        await _flush(native_client, _rows(prefix))
+        await _flush(rust_client, _rows(prefix))
+        await _flush(rust_client, _rows(prefix))
     finally:
-        uninstall_native_spend_log_writer(native_client)
-    native_stored: Final = await _stored(url, prefix)
+        uninstall_rust_spend_log_writer(rust_client)
+    rust_stored: Final = await _stored(url, prefix)
 
     assert writer is not None
     assert len(writer) == 0
     assert [len(python_stored[0]), len(python_stored[1])] == [3, 4]
-    assert native_stored == python_stored
+    assert rust_stored == python_stored

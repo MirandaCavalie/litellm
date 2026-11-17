@@ -1,3 +1,5 @@
+//! Python binding for the Rust spend log writer (`litellm-spend-log-writer`).
+
 use std::sync::Arc;
 
 use litellm_spend_log_writer::{
@@ -10,15 +12,17 @@ use crate::db::NativeDatabase;
 
 pyo3::create_exception!(
     _native,
-    NativeSpendLogWriteFailure,
+    RustSpendLogWriteFailure,
     pyo3::exceptions::PyException,
-    "A native spend log write failed. requeue says whether the rows must go back to the queue, and kind is litellm-db's ErrorKind or invalid_metadata."
+    "A spend log write in Rust failed. requeue says whether the rows must go back to the queue, and kind is litellm-db's ErrorKind or invalid_metadata."
 );
 
 type RetentionFields = (Option<Vec<String>>, Option<Vec<String>>, Vec<String>);
 
-#[pyclass(frozen, name = "NativeSpendLogWriter")]
-pub struct NativeSpendLogWriter {
+/// The Rust spend log queue and writer the proxy uses on the ledger-on path. Rows
+/// cross as JSON text; `write` returns an awaitable that commits a batch.
+#[pyclass(frozen, name = "RustSpendLogWriter")]
+pub struct RustSpendLogWriter {
     writer: Arc<SpendLogWriter<PgLedgerStore>>,
 }
 
@@ -27,7 +31,7 @@ fn map_failure(failure: WriteFailure) -> PyErr {
         WriteError::Database(error) => error.kind().into(),
         WriteError::Metadata(_) => "invalid_metadata",
     };
-    let error = NativeSpendLogWriteFailure::new_err(failure.to_string());
+    let error = RustSpendLogWriteFailure::new_err(failure.to_string());
     let decided = Python::attach(|py| {
         let value = error.value(py);
         value.setattr("requeue", failure.requeue)?;
@@ -39,6 +43,8 @@ fn map_failure(failure: WriteFailure) -> PyErr {
     }
 }
 
+/// Parses JSON rows, returning the rows it can hold and the indexes of those it cannot
+/// (such as text with lone surrogates).
 fn decoded(rows: &[String]) -> (Vec<SpendLogRow>, Vec<usize>) {
     let mut kept = Vec::with_capacity(rows.len());
     let mut refused = Vec::new();
@@ -52,7 +58,7 @@ fn decoded(rows: &[String]) -> (Vec<SpendLogRow>, Vec<usize>) {
 }
 
 #[pymethods]
-impl NativeSpendLogWriter {
+impl RustSpendLogWriter {
     #[new]
     #[pyo3(signature = (database, *, queue_max_bytes, write_batch_max_bytes, write_batch_max_rows, queue_size_threshold, poll_interval_seconds, max_backoff_seconds, max_depth))]
     #[expect(
@@ -137,7 +143,7 @@ impl NativeSpendLogWriter {
         let (rows, refused) = decoded(&rows);
         if !refused.is_empty() {
             return Err(PyValueError::new_err(format!(
-                "{} spend log rows are not JSON objects the native writer can hold",
+                "{} spend log rows are not JSON objects the Rust writer can hold",
                 refused.len()
             )));
         }
