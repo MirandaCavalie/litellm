@@ -8,13 +8,15 @@
 //! | [`literal`] | `ast.literal_eval(text)` |
 //! | [`repr`] | `repr(value)` and `str(value)` |
 //! | [`reprlib`] | `reprlib.repr(value)` |
-//! | [`json`] | `json.dumps(value)` and `json.loads(text)` |
+//! | [`json`] | `json.dumps(value)`, compact `json.dumps`, and `json.loads(text)` |
 //! | [`pickle`] | `pickle.loads(data)` and `pickle.dumps(value)` for plain data |
-//! | [`truthy`] | `bool(value)` |
-//! | [`number`] | `int(text)`, `float(text)`, `int(seconds)` as a `Duration`, and `str()` of an `int` or `float` |
+//! | [`truthy`] | `bool(value)` and `first or second` |
+//! | [`dict`] | `dict` reads and `d[key] = value` writes, in insertion order |
+//! | [`pystr`] | `len(text)` and `text[start:end]` over code points |
+//! | [`number`] | `sum()` of floats, `int(text)`, `float(text)`, `int(seconds)` as a `Duration`, and `str()` of an `int` or `float` |
 //! | [`format`] | `format(value, f".{precision}f")` |
 //! | [`unicode`] | `str.isspace()` for one character |
-//! | [`pydantic`] | `TypeAdapter(bool)` and `TypeAdapter(int)` lax validation |
+//! | [`pydantic`] | `TypeAdapter(bool)`, `TypeAdapter(int)` and `TypeAdapter(float)` lax validation |
 //! | [`urllib`] | `urllib.parse.quote(text, safe=safe)` |
 //! | [`datetime`] | `datetime.fromtimestamp(seconds, timezone.utc)` fields and `datetime.fromisoformat(text)` |
 //! | [`flags`] | LiteLLM's own text-to-bool helpers, such as `str_to_bool` and `_redis._str_to_bool` |
@@ -32,6 +34,7 @@
 //! - [`number`] reads ASCII digits only, while Python's `int` and `float` accept any Unicode decimal digit.
 
 pub mod datetime;
+pub mod dict;
 mod error;
 pub mod flags;
 pub mod format;
@@ -41,6 +44,7 @@ pub mod literal;
 pub mod number;
 pub mod pickle;
 pub mod pydantic;
+pub mod pystr;
 pub mod repr;
 pub mod reprlib;
 pub mod truthy;

@@ -1,3 +1,5 @@
+//! Python truthiness: `bool(value)` and the `a or b` operator over [`Value`].
+
 use num_bigint::Sign;
 
 use crate::Value;
@@ -15,4 +17,9 @@ pub fn truthy(value: &Value) -> bool {
         Value::Tuple(values) | Value::List(values) | Value::Set(values) => !values.is_empty(),
         Value::Dict(entries) => !entries.is_empty(),
     }
+}
+
+/// `first or second`: the first value when it is truthy, else the second.
+pub fn or<'a>(first: &'a Value, second: &'a Value) -> &'a Value {
+    if truthy(first) { first } else { second }
 }
