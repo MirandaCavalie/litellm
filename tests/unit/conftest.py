@@ -134,7 +134,6 @@ os.environ["PYTHON_DOTENV_DISABLED"] = "1"
 os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
 
 import litellm  # noqa: E402  # litellm reads LITELLM_LOCAL_MODEL_COST_MAP at import
-from litellm.litellm_core_utils.model_cost_table import publish  # noqa: E402  # same import-time dependency
 from litellm._logging import ALL_LOGGERS  # noqa: E402  # same import-time dependency
 from litellm.anthropic_beta_headers_manager import (
     reload_beta_headers_config,  # noqa: E402  # same import-time dependency
@@ -143,6 +142,7 @@ from litellm.litellm_core_utils.get_model_cost_map import (  # noqa: E402  # sam
     model_cost_inputs,
 )
 from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER  # noqa: E402  # same import-time dependency
+from litellm.litellm_core_utils.model_cost_table import publish  # noqa: E402  # same import-time dependency
 from litellm.litellm_core_utils.prompt_templates import (
     factory as prompt_factory_module,  # noqa: E402  # same import-time dependency
 )
@@ -604,3 +604,21 @@ def in_operator_error(value: Container[object]) -> str:
     with pytest.raises(TypeError) as native:
         _ = "key" in value
     return str(native.value)
+
+
+@pytest.fixture(autouse=True)
+def team_and_organization_stores_find_no_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unit tests never open a Rust database, so team, team membership and organization reads find no row
+    unless the test installs rows through ``tests.unit.proxy.rust_auth_stores``."""
+    from litellm.proxy.db import rust_database
+    from litellm.rust_bridge._native import RustOrganizationStore, RustTeamMembershipStore, RustTeamStore
+    from tests.unit.proxy.rust_auth_stores import RustAuthStores
+
+    empty: Final = RustAuthStores()
+    fakes: Final[dict[object, object]] = {
+        RustTeamStore: empty.team,
+        RustTeamMembershipStore: empty.team_membership,
+        RustOrganizationStore: empty.organization,
+    }
+    real_store: Final = rust_database.store
+    monkeypatch.setattr(rust_database, "store", lambda kind: fakes[kind] if kind in fakes else real_store(kind))

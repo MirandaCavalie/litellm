@@ -31,6 +31,7 @@ from litellm.litellm_core_utils.dd_tracing import tracer
 from litellm.models.team_membership import LiteLLM_TeamMembership
 from litellm.models.user import LiteLLM_UserTable
 from litellm.proxy.auth.auth_checks import (
+    _rust_store,  # pyright: ignore[reportPrivateUsage]  # the membership budget read shares the store accessor
     request_skips_budget_checks,
     team_member_max_budget_alert_check,
     virtual_key_max_budget_alert_check,
@@ -50,7 +51,7 @@ from litellm.proxy.auth.user_api_key_auth import (
 from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache, team_membership_auth_cache_key
 from litellm.proxy.spend_tracking.native_budgets import native_budget_decision
 from litellm.redis.stores.spend_counters import team_member_counter
-from litellm.repositories.table_repositories import TeamMembershipRepository
+from litellm.rust_bridge._native import RustTeamMembershipStore
 from litellm.types.integrations.slack_alerting import CallInfo, Litellm_EntityType
 from litellm.types.proxy.auth.user_api_key_auth import UserAPIKeyAuth
 
@@ -110,13 +111,11 @@ class BudgetChecks:
         cached: Final = await self.user_api_key_cache.async_get_cache(key=cache_key, model_type=LiteLLM_TeamMembership)
         if cached is not None:
             return cached
-        db_member: Final = await TeamMembershipRepository(prisma_client).table.find_first(
-            where={"user_id": user_id, "team_id": team_id},
-            include={"litellm_budget_table": True},
-        )
+        _ = prisma_client
+        db_member: Final = await _rust_store(RustTeamMembershipStore).find(user_id, team_id)
         if db_member is None:
             return None
-        membership: Final = LiteLLM_TeamMembership.model_validate(db_member.model_dump())
+        membership: Final = LiteLLM_TeamMembership.model_validate_json(db_member)
         await self.user_api_key_cache.async_set_cache(
             key=cache_key, value=membership, model_type=LiteLLM_TeamMembership, ttl=5
         )

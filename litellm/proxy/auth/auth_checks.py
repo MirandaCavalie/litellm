@@ -171,7 +171,6 @@ from litellm.redis.stores.spend_counters import (
 )
 from litellm.repositories.budget_repository import BudgetRepository
 from litellm.repositories.object_permission_repository import ObjectPermissionRepository
-from litellm.repositories.organization_repository import OrganizationRepository
 from litellm.repositories.prisma_protocols import DatabaseClient, RowT_co
 from litellm.repositories.project_repository import ProjectRepository
 from litellm.repositories.table_repositories import (
@@ -179,9 +178,7 @@ from litellm.repositories.table_repositories import (
     EndUserRepository,
     ManagedVectorStoresRepository,
     TagRepository,
-    TeamMembershipRepository,
 )
-from litellm.repositories.team_repository import TeamRepository
 from litellm.repositories.user_repository import UserRepository
 from litellm.responses.additional_tools import additional_tools_in_input
 from litellm.router import Router
@@ -192,6 +189,9 @@ from litellm.rust_bridge._native import (
     RustJwtKeyMappingStore,
     RustKeyStore,
     RustModelAccessGroupStore,
+    RustOrganizationStore,
+    RustTeamMembershipStore,
+    RustTeamStore,
     jwt_key_mapping_cache_key,
 )
 from litellm.secret_managers.main import str_to_bool
@@ -229,12 +229,6 @@ class _PrismaDictableRow(Protocol):
 
 
 class _PrismaModelDumpRow(Protocol):
-    def model_dump(self) -> Mapping[str, object]: ...
-
-
-class _PrismaTeamRow(Protocol):
-    def dict(self) -> Mapping[str, object]: ...
-
     def model_dump(self) -> Mapping[str, object]: ...
 
 
@@ -341,10 +335,6 @@ def _model_dump_table(
     repo: _PrismaTableHolder[_PrismaModelDumpRow], lookup: str
 ) -> _PrismaAuthTable[_PrismaModelDumpRow]:
     return _DeadlineBoundedTable(repo.table, lookup)
-
-
-def _team_table(repo: _PrismaTableHolder[_PrismaTeamRow]) -> _PrismaAuthTable[_PrismaTeamRow]:
-    return _DeadlineBoundedTable(repo.table, "team")
 
 
 def _vector_store_table(repo: _PrismaTableHolder[_PrismaVectorStoreRow]) -> _PrismaAuthTable[_PrismaVectorStoreRow]:
@@ -662,7 +652,6 @@ _is_model_cost_zero: Final = is_model_cost_zero
 
 
 _NO_MODEL_INFO: Final[Mapping[str, object]] = MappingProxyType({})
-_TEAM_GRANT_RELATIONS: Final[Mapping[str, object]] = MappingProxyType({"litellm_model_table": True})
 
 
 def _deployments_served_for(model: str, llm_router: RegistryReader) -> Sequence[DeploymentTypedDict]:
@@ -2905,13 +2894,11 @@ async def _fetch_team_membership_from_db(
     use_writer: bool = False,
 ) -> LiteLLM_TeamMembership | None:
     _ = parent_otel_span, proxy_logging_obj
-    response: Final = await _dictable_table(
-        TeamMembershipRepository(prisma_client, use_writer=use_writer), "team_membership"
-    ).find_unique(
-        where={"user_id_team_id": {"user_id": user_id, "team_id": team_id}},
-        include={"litellm_budget_table": True},
+    found: Final = await bounded_db_lookup(
+        _rust_store(RustTeamMembershipStore).find(user_id, team_id, use_writer=use_writer),
+        name="team_membership",
     )
-    membership: Final = None if response is None else LiteLLM_TeamMembership.model_validate(response.dict())
+    membership: Final = None if found is None else LiteLLM_TeamMembership.model_validate_json(found)
     _key: Final = team_membership_reservation_cache_key(user_id=user_id, team_id=team_id)
     if membership is None:
         await user_api_key_cache.async_set_cache(
@@ -3809,10 +3796,11 @@ class AccessGroupNotFoundError(HTTPException):
 @log_db_metrics
 async def _get_team_db_check(
     team_id: str, prisma_client: PrismaClient, team_id_upsert: bool | None = None, *, use_writer: bool = False
-) -> "_PrismaTeamRow | None":
-    response = await _team_table(TeamRepository(prisma_client, use_writer=use_writer)).find_unique(
-        where={"team_id": team_id}, include=_TEAM_GRANT_RELATIONS
+) -> LiteLLM_TeamTable | None:
+    found: Final = await bounded_db_lookup(
+        _rust_store(RustTeamStore).find(team_id, use_writer=use_writer), name="team"
     )
+    response: LiteLLM_TeamTable | None = None if found is None else LiteLLM_TeamTable.model_validate_json(found)
 
     if response is None and team_id_upsert:
         from litellm.proxy.management_endpoints.team_endpoints import new_team
@@ -3829,10 +3817,6 @@ async def _get_team_db_check(
         )
         response = LiteLLM_TeamTable.model_validate(created_team_dict)
     return response
-
-
-async def _get_team_object_from_db(team_id: str, prisma_client: PrismaClient) -> "_PrismaTeamRow | None":
-    return await _team_table(TeamRepository(prisma_client)).find_unique(where={"team_id": team_id})
 
 
 async def _get_team_object_from_user_api_key_cache(
@@ -4134,8 +4118,8 @@ async def get_team_object_by_alias(
 
     # Query database by team_alias
     try:
-        teams: Final = await _team_table(TeamRepository(prisma_client)).find_many(
-            where={"team_alias": team_alias}, include=_TEAM_GRANT_RELATIONS
+        teams: Final = await bounded_db_lookup(
+            _rust_store(RustTeamStore).find_by_alias(team_alias), name="team_by_alias"
         )
 
         if not teams:
@@ -4154,8 +4138,7 @@ async def get_team_object_by_alias(
                 },
             )
 
-        team: Final = teams[0]
-        team_obj: Final = LiteLLM_TeamTableCachedObj.model_validate(team.model_dump())
+        team_obj: Final = LiteLLM_TeamTableCachedObj.model_validate_json(teams[0])
 
         # Load object_permission if object_permission_id exists but object_permission is not loaded
         if team_obj.object_permission_id and not team_obj.object_permission:
@@ -4242,8 +4225,8 @@ async def get_org_object_by_alias(
 
     # Query database by organization_alias
     try:
-        orgs = await _model_dump_table(OrganizationRepository(prisma_client), "organization").find_many(
-            where={"organization_alias": org_alias}
+        orgs: Final = await bounded_db_lookup(
+            _rust_store(RustOrganizationStore).find_by_alias(org_alias), name="organization_by_alias"
         )
 
         if not orgs:
@@ -4262,8 +4245,7 @@ async def get_org_object_by_alias(
                 },
             )
 
-        org: Final = orgs[0]
-        org_obj: Final = LiteLLM_OrganizationTable.model_validate(org.model_dump())
+        org_obj: Final = LiteLLM_OrganizationTable.model_validate_json(orgs[0])
 
         # Cache the result
         await user_api_key_cache.async_set_cache(
@@ -4781,29 +4763,16 @@ async def get_org_object(
     )
     if deserialized_org is not None:
         return deserialized_org
-    # else, check db
-    try:
-        query_kwargs: Final[dict[str, Mapping[str, object]]] = {"where": {"organization_id": org_id}}
-        if include_budget_table:
-            query_kwargs["include"] = {"litellm_budget_table": True}
-
-        response: Final = await _model_dump_table(OrganizationRepository(prisma_client), "organization").find_unique(
-            **query_kwargs
-        )
-    except Exception:
-        # An operational failure (DB down, timeout, cache fault) is NOT the same fact as a confirmed
-        # missing row, and relabelling it as "doesn't exist" made every caller unable to tell them
-        # apart — a caller that treats absence as "this org places no restriction" then drops a real
-        # org ceiling during an outage. Propagate the real error; callers that already catch
-        # Exception are unaffected.
-        raise
-
-    if response is None:
+    found: Final = await bounded_db_lookup(
+        _rust_store(RustOrganizationStore).find(org_id, include_budget_table=include_budget_table),
+        name="organization",
+    )
+    if found is None:
         raise OrganizationNotFoundError(
             f"Organization doesn't exist in db. Organization={org_id}. Create organization via `/organization/new` call."
         )
 
-    _org_obj: Final = LiteLLM_OrganizationTable.model_validate(response.model_dump())
+    _org_obj: Final = LiteLLM_OrganizationTable.model_validate_json(found)
     # Cache the result
     await user_api_key_cache.async_set_cache(
         key=cache_key,
