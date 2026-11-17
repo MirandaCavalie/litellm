@@ -1151,16 +1151,6 @@ async def test_a_ready_snapshot_member_behind_more_cooling_members_than_one_swee
     assert isinstance(claimed, Released)
 
 
-class CountsAdmits(StallsAfterEnqueue):
-    def __init__(self, inner: LocalQueueBackend) -> None:
-        super().__init__(inner)
-        self.admits = 0
-
-    async def admit(self, request: WaitRequest, budget_ms: int, ready_in_ms: int = 0) -> AdmitReply:
-        self.admits += 1
-        return await self.inner.admit(request, budget_ms, ready_in_ms)
-
-
 def _readiness_lookup_taking(timer: ManualTimer, seconds: float) -> "Callable[[], Coroutine[object, object, float]]":
     async def lookup() -> float:
         timer.at += seconds
@@ -1169,19 +1159,37 @@ def _readiness_lookup_taking(timer: ManualTimer, seconds: float) -> "Callable[[]
     return lookup
 
 
-async def test_a_readiness_lookup_that_used_up_the_budget_times_out_before_admitting() -> None:
+async def _stalled_readiness() -> float:
+    await asyncio.Event().wait()
+    raise AssertionError("unreachable")
+
+
+@pytest.mark.parametrize("stalls", [False, True], ids=["slow_lookup", "lookup_cut_off_at_the_budget"])
+@pytest.mark.parametrize(("congested", "admitted"), [(False, True), (True, False)], ids=["healthy", "congested"])
+async def test_a_readiness_lookup_that_used_up_the_budget_passes_a_healthy_capacity_and_never_queues_a_congested_one(
+    stalls: bool, congested: bool, admitted: bool
+) -> None:
     timer: Final = ManualTimer()
-    inner: Final = _backend(timer)
-    await _congest(inner, retry_after_ms=FAR)
-    counting: Final = CountsAdmits(inner)
+    inner: Final = _backend(timer, max_waiting=1)
+    if congested:
+        await _congest(inner, retry_after_ms=FAR)
+    readiness: Final = _stalled_readiness if stalls else _readiness_lookup_taking(timer, 0.125)
+    admitting: Final = asyncio.create_task(DynamicQueue(inner, timer).admit(_request("late"), 0.125, readiness))
+    try:
+        if stalls:
+            await timer.parked(count=1)
+            timer.advance(0.125)
+        result: Final = await _finished(admitting)
+    finally:
+        await _reap(admitting)
+    next_arrival: Final = await inner.admit(_request("next"), FAR)
 
-    result: Final = await DynamicQueue(counting, timer).admit(
-        _request("late"), 0.125, _readiness_lookup_taking(timer, 0.125)
-    )
-
-    assert isinstance(result, QueueTimeout)
-    assert counting.admits == 0
+    if admitted:
+        assert isinstance(result, Admitted) and isinstance(result.grant, PassThrough)
+    else:
+        assert result == QueueTimeout()
     assert timer.at == 0.125
+    assert isinstance(next_arrival, PassThrough if admitted else Waiting)
 
 
 async def test_a_poll_after_a_slow_readiness_lookup_only_gets_the_time_that_is_left() -> None:

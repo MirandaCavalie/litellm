@@ -345,14 +345,12 @@ class DynamicQueue:
         operation_s: Final = _operation_s(self._backend)
         budget_s: Final = deadline - self._timer.now()
         ready_in_ms: Final = await self._ready_in_ms(readiness, min(operation_s, budget_s))
-        if ready_in_ms is None:
-            return QueueTimeout() if budget_s < operation_s else CoordinationUnavailable(reason=OPERATION_TIMED_OUT)
         left: Final = deadline - self._timer.now()
-        if budget_s > 0 and left <= 0:
-            return QueueTimeout()
-        bound_s: Final = operation_s if budget_s <= 0 else min(operation_s, left)
+        if ready_in_ms is None and left > 0:
+            return QueueTimeout() if budget_s < operation_s else CoordinationUnavailable(reason=OPERATION_TIMED_OUT)
+        bound_s: Final = operation_s if left <= 0 else min(operation_s, left)
         budget_ms: Final = max(int(left * 1000), 0)
-        first: Final = await self._within(self._backend.admit(request, budget_ms, ready_in_ms), bound_s)
+        first: Final = await self._within(self._backend.admit(request, budget_ms, ready_in_ms or 0), bound_s)
         if first is None:
             return QueueTimeout() if bound_s < operation_s else CoordinationUnavailable(reason=OPERATION_TIMED_OUT)
         if isinstance(first, Gone):
