@@ -488,7 +488,7 @@ mod tests {
         let (flusher, _) = flusher(store);
         let batch = [
             row(
-                r#"{"request_id": "good", "call_type": "acompletion", "messages": "[]", "accounting_payload": {}}"#,
+                r#"{"request_id": "good", "call_type": "acompletion", "startTime": "2026-11-02 12:00:00", "endTime": "2026-11-02 12:00:00", "messages": "[]", "accounting_payload": {}}"#,
             ),
             row(
                 r#"{"request_id": "unparseable", "call_type": "acompletion", "messages": "not json", "accounting_payload": {"spend": 1.0}}"#,

@@ -1,9 +1,7 @@
 use std::time::Duration;
 
 use chrono::Utc;
-use litellm_db::{
-    Error, Pools, insert_spend_log_rows, spend_log_timestamp, within, write_spend_log_ledger,
-};
+use litellm_db::{Error, Pools, insert_spend_log_rows, within, write_spend_log_ledger};
 
 use crate::{LedgerStore, SpendLogRow, ledger_request};
 
@@ -39,10 +37,9 @@ impl PgLedgerStore {
         let legacy = if request.legacy.is_empty() {
             0
         } else {
-            let now = spend_log_timestamp(Utc::now());
             within(
                 self.socket_timeout,
-                insert_spend_log_rows(pool, &request.legacy, &now, self.named),
+                insert_spend_log_rows(pool, &request.legacy, Utc::now().naive_utc(), self.named),
             )
             .await?
             .len()

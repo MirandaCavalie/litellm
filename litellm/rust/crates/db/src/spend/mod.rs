@@ -16,8 +16,8 @@ pub use daily_user_spend::{DailySpend, upsert_daily_user_spend};
 pub use end_user_spend::add_end_user_spend;
 pub use key_spend::{EntitySpend, add_key_spend};
 pub use spend_log_ledger::{
-    SPEND_LOG_COLUMNS, SPEND_LOG_JSON_COLUMNS, SpendLogDelivery, SpendLogLedgerEntry,
-    insert_spend_log_ledger, insert_spend_log_rows, spend_log_record, spend_log_timestamp,
+    SPEND_LOG_JSON_COLUMNS, SpendLogDelivery, SpendLogLedgerEntry, SpendLogRecord,
+    insert_spend_log_ledger, insert_spend_log_rows, parse_spend_log_timestamp,
     write_spend_log_ledger,
 };
 pub use spend_logs::{SpendLog, SpendLogRow, insert_spend_logs};

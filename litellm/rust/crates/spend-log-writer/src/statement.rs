@@ -1,17 +1,18 @@
-use litellm_db::{Error, SPEND_LOG_JSON_COLUMNS, SpendLogDelivery, SpendLogLedgerEntry};
+use litellm_db::{
+    Error, SPEND_LOG_JSON_COLUMNS, SpendLogDelivery, SpendLogLedgerEntry, SpendLogRecord,
+};
 use litellm_python_compat::{
     Value,
     json::{dumps, loads},
     repr::to_str,
+    safe_json::{jsonify_object, safe_json},
 };
-use serde_json::{Map, Number};
+use serde_json::Map;
 
 use crate::{
     SpendLogRow,
     row::{ACCOUNTING_DELIVERY_ID, ACCOUNTING_LOG_DISABLED, ACCOUNTING_PAYLOAD},
 };
-
-const MAX_DEPTH_EXCEEDED: &str = "MaxDepthExceeded";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Retention {
@@ -59,7 +60,7 @@ pub fn retain_metadata(
         })
         .map(|entry| entry.map(|(key, value)| (Value::Str(key), value)))
         .collect::<Result<Vec<_>, _>>()?;
-    let text = sanitized(&Value::Dict(retained), 0, max_depth).to_string();
+    let text = safe_json(&Value::Dict(retained), 0, max_depth).to_string();
     let reparsed = loads(&text).map_err(|_| InvalidMetadata)?;
     Ok(row.with(
         "metadata",
@@ -68,85 +69,23 @@ pub fn retain_metadata(
 }
 
 pub fn jsonified(row: &SpendLogRow) -> SpendLogRow {
-    SpendLogRow::new(
-        row.entries()
-            .iter()
-            .map(|(key, value)| match value {
-                Value::Dict(_) => (
-                    key.clone(),
-                    Value::Str(
-                        dumps(value).unwrap_or_else(|_| "failed-to-serialize-json".to_owned()),
-                    ),
-                ),
-                _ => (key.clone(), value.clone()),
-            })
-            .collect(),
-    )
-}
-
-fn strip_nul(text: &str) -> String {
-    text.replace('\0', "")
-}
-
-pub fn sanitized(value: &Value, depth: usize, max_depth: usize) -> serde_json::Value {
-    if depth > max_depth {
-        return serde_json::Value::String(MAX_DEPTH_EXCEEDED.to_owned());
-    }
-    match value {
-        Value::None => serde_json::Value::Null,
-        Value::Bool(value) => serde_json::Value::Bool(*value),
-        Value::Int(value) => {
-            let text = value.to_string();
-            text.parse::<i64>()
-                .map(Number::from)
-                .or_else(|_| text.parse::<u64>().map(Number::from))
-                .ok()
-                .or_else(|| text.parse::<f64>().ok().and_then(Number::from_f64))
-                .map_or(serde_json::Value::Null, serde_json::Value::Number)
-        }
-        Value::Float(value) => {
-            Number::from_f64(*value).map_or(serde_json::Value::Null, serde_json::Value::Number)
-        }
-        Value::Str(text) => serde_json::Value::String(strip_nul(text)),
-        Value::List(values) | Value::Tuple(values) | Value::Set(values) => {
-            serde_json::Value::Array(
-                values
-                    .iter()
-                    .map(|value| sanitized(value, depth + 1, max_depth))
-                    .collect(),
-            )
-        }
-        Value::Dict(entries) => serde_json::Value::Object(
-            entries
-                .iter()
-                .filter_map(|(key, value)| match key {
-                    Value::Str(key) => {
-                        Some((strip_nul(key), sanitized(value, depth + 1, max_depth)))
-                    }
-                    _ => None,
-                })
-                .collect(),
-        ),
-        other => serde_json::Value::String(strip_nul(&to_str(other))),
-    }
+    SpendLogRow::new(jsonify_object(row.entries()))
 }
 
 fn column_value(column: &str, value: &Value, max_depth: usize) -> Result<serde_json::Value, Error> {
     match value {
         Value::Str(text) if SPEND_LOG_JSON_COLUMNS.contains(&column) => loads(text)
-            .map(|parsed| sanitized(&parsed, 2, max_depth))
+            .map(|parsed| safe_json(&parsed, 2, max_depth))
             .map_err(|_| {
                 Error::RejectedSpendLogRow(format!("Spend log column {column} is not valid JSON"))
             }),
-        value => Ok(sanitized(value, 2, max_depth)),
+        value => Ok(safe_json(value, 2, max_depth)),
     }
 }
 
-fn spend_log_values(
-    row: &SpendLogRow,
-    max_depth: usize,
-) -> Result<Map<String, serde_json::Value>, Error> {
-    row.entries()
+fn spend_log_record(row: &SpendLogRow, max_depth: usize) -> Result<SpendLogRecord, Error> {
+    let columns = row
+        .entries()
         .iter()
         .filter(|(key, _)| {
             ![
@@ -157,7 +96,8 @@ fn spend_log_values(
             .contains(&key.as_str())
         })
         .map(|(key, value)| Ok((key.clone(), column_value(key, value, max_depth)?)))
-        .collect()
+        .collect::<Result<Map<_, _>, Error>>()?;
+    SpendLogRecord::from_columns(columns)
 }
 
 fn accounting_payload(value: &Value) -> Result<Value, Error> {
@@ -187,7 +127,7 @@ pub fn delivery_id(row: &SpendLogRow) -> String {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct LedgerRequest {
-    pub legacy: Vec<Map<String, serde_json::Value>>,
+    pub legacy: Vec<SpendLogRecord>,
     pub ledger: Vec<SpendLogLedgerEntry>,
 }
 
@@ -195,11 +135,11 @@ pub fn ledger_request(rows: &[SpendLogRow], max_depth: usize) -> Result<LedgerRe
     let mut request = LedgerRequest::default();
     for row in rows {
         let Some(payload) = row.get(ACCOUNTING_PAYLOAD) else {
-            request.legacy.push(spend_log_values(row, max_depth)?);
+            request.legacy.push(spend_log_record(row, max_depth)?);
             continue;
         };
         let serde_json::Value::Object(accounting_payload) =
-            sanitized(&accounting_payload(payload)?, 2, max_depth)
+            safe_json(&accounting_payload(payload)?, 2, max_depth)
         else {
             return Err(Error::InvalidSpendLogDelivery(
                 "accounting_payload is not a JSON object".into(),
@@ -208,18 +148,16 @@ pub fn ledger_request(rows: &[SpendLogRow], max_depth: usize) -> Result<LedgerRe
         request.ledger.push(SpendLogLedgerEntry {
             delivery: SpendLogDelivery {
                 delivery_id: delivery_id(row),
-                request_id: row
-                    .get("request_id")
-                    .map_or(serde_json::Value::Null, |value| {
-                        sanitized(value, 2, max_depth)
-                    }),
+                request_id: row.get("request_id").map(to_str).ok_or_else(|| {
+                    Error::RejectedSpendLogRow("spend log row has no request_id".into())
+                })?,
                 accounting_payload,
                 is_batch: row.get(ACCOUNTING_DELIVERY_ID).is_none(),
             },
             row: if row.log_disabled() {
                 None
             } else {
-                Some(spend_log_values(row, max_depth)?)
+                Some(spend_log_record(row, max_depth)?)
             },
         });
     }
@@ -264,27 +202,17 @@ mod tests {
     }
 
     #[rstest]
-    #[case::dict_becomes_text(
-        r#"{"accounting_payload": {"spend": 1.0}}"#,
-        r#"{"accounting_payload": "{\"spend\": 1.0}"}"#
-    )]
-    #[case::list_stays(r#"{"messages": [1]}"#, r#"{"messages": [1]}"#)]
-    fn jsonify_dumps_top_level_dicts(#[case] text: &str, #[case] expected: &str) {
-        assert_eq!(jsonified(&row(text)).to_json(), expected);
-    }
-
-    #[rstest]
     #[case::ledger_row(
-        r#"{"request_id": "r", "accounting_delivery_id": "d", "accounting_payload": "{\"spend\": NaN}", "accounting_log_disabled": false, "metadata": "{\"a\": \"x\\u0000y\"}"}"#,
-        json!({"legacy": [], "ledger": [["d", "r", {"spend": null}, false, {"request_id": "r", "metadata": {"a": "xy"}}]]})
+        r#"{"request_id": "r", "call_type": "c", "startTime": "2026-11-02 12:00:00+00:00", "endTime": "2026-11-02 12:00:01+00:00", "accounting_delivery_id": "d", "accounting_payload": "{\"spend\": NaN}", "accounting_log_disabled": false, "metadata": "{\"a\": \"x\\u0000y\"}"}"#,
+        json!({"legacy": [], "ledger": [["d", "r", {"spend": null}, false, ["r", {"a": "xy"}]]]})
     )]
     #[case::batch_job_without_log(
         r#"{"request_id": "job", "accounting_payload": {"spend": 2}, "accounting_log_disabled": true}"#,
         json!({"legacy": [], "ledger": [["job", "job", {"spend": 2}, true, null]]})
     )]
     #[case::legacy_row(
-        r#"{"request_id": "old", "request_tags": "[\"t\"]"}"#,
-        json!({"legacy": [{"request_id": "old", "request_tags": ["t"]}], "ledger": []})
+        r#"{"request_id": "old", "call_type": "c", "startTime": "2026-11-02 12:00:00", "endTime": "2026-11-02 12:00:00", "request_tags": "[\"t\"]"}"#,
+        json!({"legacy": [["old", ["t"]]], "ledger": []})
     )]
     fn builds_the_ledger_request(#[case] text: &str, #[case] expected: serde_json::Value) {
         let request = ledger_request(&[jsonified(&row(text))], 100).expect("request builds");
@@ -297,20 +225,29 @@ mod tests {
                     entry.delivery.request_id,
                     entry.delivery.accounting_payload,
                     entry.delivery.is_batch,
-                    entry.row,
+                    entry
+                        .row
+                        .as_ref()
+                        .map(|row| json!([row.request_id, row.metadata])),
                 ])
             })
             .collect();
+        let legacy: Vec<serde_json::Value> = request
+            .legacy
+            .iter()
+            .map(|row| json!([row.request_id, row.request_tags]))
+            .collect();
 
-        assert_eq!(
-            json!({"legacy": request.legacy, "ledger": ledger}),
-            expected
-        );
+        assert_eq!(json!({"legacy": legacy, "ledger": ledger}), expected);
     }
 
     #[rstest]
     #[case::invalid_json_column(
         r#"{"request_id": "r", "accounting_payload": {}, "messages": "not json"}"#,
+        ErrorKind::DataRejected
+    )]
+    #[case::missing_required_column(
+        r#"{"request_id": "r", "accounting_payload": {}, "messages": "[]"}"#,
         ErrorKind::DataRejected
     )]
     #[case::payload_not_an_object(

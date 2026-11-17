@@ -1,50 +1,23 @@
+//! The spend log ledger transaction: one commit records each request's accounting
+//! delivery in `LiteLLM_SpendLogDelivery` and its request log in `LiteLLM_SpendLogs`,
+//! so a replayed flush can neither charge a request twice nor lose its log.
+//!
+//! The statements mirror the Python ledger writer (`SpendLogsRepository._insert_ledger`):
+//! deliveries go in first with `ON CONFLICT DO NOTHING`, a batch or video job that a
+//! pre-ledger cost row already charged loses its delivery again, and only the rows whose
+//! delivery this commit accepted are logged.
+
 use std::{collections::BTreeMap, time::Duration};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, Utc};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value, json};
 use sqlx::{PgExecutor, PgPool, Postgres, Transaction};
 
 use crate::{Error, Statements};
 
-pub const SPEND_LOG_COLUMNS: [&str; 36] = [
-    "request_id",
-    "call_type",
-    "api_key",
-    "spend",
-    "total_tokens",
-    "prompt_tokens",
-    "completion_tokens",
-    "startTime",
-    "endTime",
-    "request_duration_ms",
-    "completionStartTime",
-    "model",
-    "model_id",
-    "model_group",
-    "custom_llm_provider",
-    "api_base",
-    "user",
-    "metadata",
-    "cache_hit",
-    "cache_key",
-    "request_tags",
-    "team_id",
-    "organization_id",
-    "end_user",
-    "requester_ip_address",
-    "messages",
-    "response",
-    "session_id",
-    "status",
-    "mcp_namespaced_tool_name",
-    "billing_agent_id",
-    "agent_id",
-    "proxy_server_request",
-    "litellm_call_id",
-    "created_at",
-    "updated_at",
-];
-
+/// The `LiteLLM_SpendLogs` columns a request log stores as `jsonb`, which callers
+/// hand over as JSON text.
 pub const SPEND_LOG_JSON_COLUMNS: [&str; 5] = [
     "metadata",
     "request_tags",
@@ -53,65 +26,193 @@ pub const SPEND_LOG_JSON_COLUMNS: [&str; 5] = [
     "proxy_server_request",
 ];
 
-fn column_default(column: &str, now: &str) -> Value {
-    match column {
-        "api_key"
-        | "model"
-        | "model_id"
-        | "model_group"
-        | "custom_llm_provider"
-        | "api_base"
-        | "user"
-        | "cache_hit"
-        | "cache_key" => json!(""),
-        "spend" => json!(0.0),
-        "total_tokens" | "prompt_tokens" | "completion_tokens" => json!(0),
-        "metadata" | "messages" | "response" | "proxy_server_request" => json!({}),
-        "request_tags" => json!([]),
-        "created_at" | "updated_at" => json!(now),
-        _ => Value::Null,
-    }
+fn empty_text() -> Option<String> {
+    Some(String::new())
 }
 
-pub fn spend_log_timestamp(now: DateTime<Utc>) -> String {
-    now.format("%Y-%m-%dT%H:%M:%S%.6f+00:00").to_string()
+fn empty_object() -> Option<Value> {
+    Some(json!({}))
 }
 
-pub fn spend_log_record(row: &Map<String, Value>, now: &str) -> Result<Map<String, Value>, Error> {
-    if let Some(unknown) = row
-        .keys()
-        .find(|key| !SPEND_LOG_COLUMNS.contains(&key.as_str()))
-    {
-        return Err(Error::RejectedSpendLogRow(format!(
-            "unknown spend log column {unknown}"
-        )));
-    }
-    Ok(SPEND_LOG_COLUMNS
-        .iter()
-        .map(|column| {
-            let value = row
-                .get(*column)
-                .cloned()
-                .unwrap_or_else(|| column_default(column, now));
-            ((*column).to_owned(), value)
+fn empty_array() -> Option<Value> {
+    Some(json!([]))
+}
+
+/// Reads a request log timestamp as the proxy writes it: RFC 3339 with an offset (made
+/// UTC), or a naive `T`- or space-separated time taken as UTC.
+pub fn parse_spend_log_timestamp(text: &str) -> Option<NaiveDateTime> {
+    DateTime::parse_from_rfc3339(text)
+        .map(|timestamp| timestamp.naive_utc())
+        .or_else(|_| {
+            DateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f%:z").map(|t| t.naive_utc())
         })
-        .collect())
+        .or_else(|_| NaiveDateTime::parse_from_str(text, "%Y-%m-%dT%H:%M:%S%.f"))
+        .or_else(|_| NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f"))
+        .ok()
 }
 
+fn timestamp<'de, D: Deserializer<'de>>(deserializer: D) -> Result<NaiveDateTime, D::Error> {
+    let text = String::deserialize(deserializer)?;
+    parse_spend_log_timestamp(&text)
+        .ok_or_else(|| serde::de::Error::custom(format!("invalid timestamp {text:?}")))
+}
+
+fn optional_timestamp<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<NaiveDateTime>, D::Error> {
+    Option::<String>::deserialize(deserializer)?
+        .map(|text| {
+            parse_spend_log_timestamp(&text)
+                .ok_or_else(|| serde::de::Error::custom(format!("invalid timestamp {text:?}")))
+        })
+        .transpose()
+}
+
+fn timestamp_text<S: Serializer>(value: &NaiveDateTime, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.collect_str(&value.format("%Y-%m-%dT%H:%M:%S%.f"))
+}
+
+fn optional_timestamp_text<S: Serializer>(
+    value: &Option<NaiveDateTime>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match value {
+        Some(value) => timestamp_text(value, serializer),
+        None => serializer.serialize_none(),
+    }
+}
+
+/// One `LiteLLM_SpendLogs` row, parsed from the request log the proxy queued.
+///
+/// A column the log leaves out takes the schema default, as a Prisma insert would; an
+/// explicit `null` stays `NULL`; a column the table does not have refuses the row.
+/// `created_at` and `updated_at` default to the commit time.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpendLogRecord {
+    pub request_id: String,
+    pub call_type: String,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default)]
+    pub spend: f64,
+    #[serde(default)]
+    pub total_tokens: i32,
+    #[serde(default)]
+    pub prompt_tokens: i32,
+    #[serde(default)]
+    pub completion_tokens: i32,
+    #[serde(
+        rename = "startTime",
+        deserialize_with = "timestamp",
+        serialize_with = "timestamp_text"
+    )]
+    pub start_time: NaiveDateTime,
+    #[serde(
+        rename = "endTime",
+        deserialize_with = "timestamp",
+        serialize_with = "timestamp_text"
+    )]
+    pub end_time: NaiveDateTime,
+    #[serde(default)]
+    pub request_duration_ms: Option<i32>,
+    #[serde(
+        rename = "completionStartTime",
+        default,
+        deserialize_with = "optional_timestamp",
+        serialize_with = "optional_timestamp_text"
+    )]
+    pub completion_start_time: Option<NaiveDateTime>,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default = "empty_text")]
+    pub model_id: Option<String>,
+    #[serde(default = "empty_text")]
+    pub model_group: Option<String>,
+    #[serde(default = "empty_text")]
+    pub custom_llm_provider: Option<String>,
+    #[serde(default = "empty_text")]
+    pub api_base: Option<String>,
+    #[serde(default = "empty_text")]
+    pub user: Option<String>,
+    #[serde(default = "empty_object")]
+    pub metadata: Option<Value>,
+    #[serde(default = "empty_text")]
+    pub cache_hit: Option<String>,
+    #[serde(default = "empty_text")]
+    pub cache_key: Option<String>,
+    #[serde(default = "empty_array")]
+    pub request_tags: Option<Value>,
+    #[serde(default)]
+    pub team_id: Option<String>,
+    #[serde(default)]
+    pub organization_id: Option<String>,
+    #[serde(default)]
+    pub end_user: Option<String>,
+    #[serde(default)]
+    pub requester_ip_address: Option<String>,
+    #[serde(default = "empty_object")]
+    pub messages: Option<Value>,
+    #[serde(default = "empty_object")]
+    pub response: Option<Value>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub mcp_namespaced_tool_name: Option<String>,
+    #[serde(default)]
+    pub billing_agent_id: Option<String>,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default = "empty_object")]
+    pub proxy_server_request: Option<Value>,
+    #[serde(default)]
+    pub litellm_call_id: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "optional_timestamp",
+        serialize_with = "optional_timestamp_text"
+    )]
+    pub created_at: Option<NaiveDateTime>,
+    #[serde(
+        default,
+        deserialize_with = "optional_timestamp",
+        serialize_with = "optional_timestamp_text"
+    )]
+    pub updated_at: Option<NaiveDateTime>,
+}
+
+impl SpendLogRecord {
+    /// Parses one request log; a log the table cannot hold is a rejected row, so the
+    /// flush drops it alone and keeps the rest of its batch.
+    pub fn from_columns(columns: Map<String, Value>) -> Result<Self, Error> {
+        serde_json::from_value(Value::Object(columns))
+            .map_err(|error| Error::RejectedSpendLogRow(error.to_string()))
+    }
+
+    fn stamped(&self, now: NaiveDateTime) -> Self {
+        Self {
+            created_at: self.created_at.or(Some(now)),
+            updated_at: self.updated_at.or(Some(now)),
+            ..self.clone()
+        }
+    }
+}
+
+/// Inserts request logs, skipping any `request_id` already stored, and returns the ids
+/// it inserted.
 pub async fn insert_spend_log_rows(
     executor: impl PgExecutor<'_>,
-    rows: &[Map<String, Value>],
-    now: &str,
+    rows: &[SpendLogRecord],
+    now: NaiveDateTime,
     named: bool,
 ) -> Result<Vec<String>, Error> {
     if rows.is_empty() {
         return Ok(Vec::new());
     }
-    let records = Value::Array(
-        rows.iter()
-            .map(|row| spend_log_record(row, now).map(Value::Object))
-            .collect::<Result<_, _>>()?,
-    );
+    let records = serde_json::to_value(rows.iter().map(|row| row.stamped(now)).collect::<Vec<_>>())
+        .map_err(|error| Error::RejectedSpendLogRow(error.to_string()))?;
     Ok(
         sqlx::query_file_scalar!("queries/spend/insert_spend_log_rows.sql", records)
             .fetch_all(Statements::new(executor, named))
@@ -119,18 +220,22 @@ pub async fn insert_spend_log_rows(
     )
 }
 
+/// The accounting work one request leaves for the ledger worker. `accounting_payload` is
+/// the worker's own JSON contract and is stored as given; `is_batch` marks a batch or
+/// video job that settles once under its request id.
 #[macro_rules_attribute::apply(crate::db_input)]
 pub struct SpendLogDelivery {
     pub delivery_id: String,
-    pub request_id: Value,
+    pub request_id: String,
     pub accounting_payload: Map<String, Value>,
     pub is_batch: bool,
 }
 
+/// A delivery with the request log it brings, if the request is logged at all.
 #[macro_rules_attribute::apply(crate::db_input)]
 pub struct SpendLogLedgerEntry {
     pub delivery: SpendLogDelivery,
-    pub row: Option<Map<String, Value>>,
+    pub row: Option<SpendLogRecord>,
 }
 
 fn first_entry_per_delivery(entries: &[SpendLogLedgerEntry]) -> Vec<&SpendLogLedgerEntry> {
@@ -143,11 +248,14 @@ fn first_entry_per_delivery(entries: &[SpendLogLedgerEntry]) -> Vec<&SpendLogLed
     by_delivery.into_values().collect()
 }
 
+/// Writes `entries` inside `transaction`: the first entry per delivery id wins, a
+/// delivery already stored is skipped, and only the rows of accepted deliveries are
+/// logged. Returns how many deliveries this call accepted.
 pub async fn insert_spend_log_ledger(
     transaction: &mut Transaction<'_, Postgres>,
     entries: &[SpendLogLedgerEntry],
     write_spend_logs: bool,
-    now: &str,
+    now: NaiveDateTime,
     named: bool,
 ) -> Result<usize, Error> {
     let ledger = first_entry_per_delivery(entries);
@@ -198,7 +306,7 @@ pub async fn insert_spend_log_ledger(
     let kept = |delivery_id: &String| {
         accepted.contains(delivery_id) && !charged_by_legacy.contains(delivery_id)
     };
-    let rows: Vec<Map<String, Value>> = ledger
+    let rows: Vec<SpendLogRecord> = ledger
         .iter()
         .filter(|entry| kept(&entry.delivery.delivery_id))
         .filter_map(|entry| entry.row.clone())
@@ -209,6 +317,8 @@ pub async fn insert_spend_log_ledger(
     Ok(accepted.iter().filter(|id| kept(id)).count())
 }
 
+/// Commits `entries` as one transaction, giving up with `TransactionTimedOut` after
+/// `timeout` so a stuck commit cannot hold the flush forever.
 pub async fn write_spend_log_ledger(
     pool: &PgPool,
     entries: &[SpendLogLedgerEntry],
@@ -216,11 +326,11 @@ pub async fn write_spend_log_ledger(
     timeout: Duration,
     named: bool,
 ) -> Result<usize, Error> {
-    let now = spend_log_timestamp(Utc::now());
+    let now = Utc::now().naive_utc();
     let commit = async {
         let mut transaction = pool.begin().await?;
         let accepted =
-            insert_spend_log_ledger(&mut transaction, entries, write_spend_logs, &now, named)
+            insert_spend_log_ledger(&mut transaction, entries, write_spend_logs, now, named)
                 .await?;
         transaction.commit().await?;
         Ok(accepted)
@@ -238,13 +348,56 @@ mod tests {
     use serde_json::{Map, Value, json};
     use sqlx::{PgExecutor, PgPool};
 
+    use chrono::NaiveDateTime;
+
     use super::{
-        SPEND_LOG_COLUMNS, SpendLogDelivery, SpendLogLedgerEntry, insert_spend_log_ledger,
-        insert_spend_log_rows, write_spend_log_ledger,
+        SpendLogDelivery, SpendLogLedgerEntry, SpendLogRecord, insert_spend_log_ledger,
+        insert_spend_log_rows, parse_spend_log_timestamp, write_spend_log_ledger,
     };
     use crate::{Error, ErrorKind, test_support::database_pool};
 
-    const NOW: &str = "2026-11-02T12:00:00.000000+00:00";
+    const SPEND_LOG_COLUMNS: [&str; 36] = [
+        "request_id",
+        "call_type",
+        "api_key",
+        "spend",
+        "total_tokens",
+        "prompt_tokens",
+        "completion_tokens",
+        "startTime",
+        "endTime",
+        "request_duration_ms",
+        "completionStartTime",
+        "model",
+        "model_id",
+        "model_group",
+        "custom_llm_provider",
+        "api_base",
+        "user",
+        "metadata",
+        "cache_hit",
+        "cache_key",
+        "request_tags",
+        "team_id",
+        "organization_id",
+        "end_user",
+        "requester_ip_address",
+        "messages",
+        "response",
+        "session_id",
+        "status",
+        "mcp_namespaced_tool_name",
+        "billing_agent_id",
+        "agent_id",
+        "proxy_server_request",
+        "litellm_call_id",
+        "created_at",
+        "updated_at",
+    ];
+
+    fn now() -> NaiveDateTime {
+        parse_spend_log_timestamp("2026-11-02T12:00:00+00:00").expect("timestamp parses")
+    }
 
     fn object(value: Value) -> Map<String, Value> {
         match value {
@@ -253,8 +406,12 @@ mod tests {
         }
     }
 
-    fn row(request_id: &str) -> Map<String, Value> {
-        object(json!({
+    fn record(columns: Value) -> SpendLogRecord {
+        SpendLogRecord::from_columns(object(columns)).expect("record parses")
+    }
+
+    fn row(request_id: &str) -> SpendLogRecord {
+        record(json!({
             "request_id": request_id,
             "call_type": "acompletion",
             "api_key": "hashed",
@@ -268,11 +425,56 @@ mod tests {
         }))
     }
 
+    #[rstest]
+    #[case::rfc3339_offset("2026-11-02T14:00:00+02:00", "2026-11-02T12:00:00.000")]
+    #[case::python_str_of_an_aware_datetime(
+        "2026-11-02 12:00:00.250000+00:00",
+        "2026-11-02T12:00:00.250"
+    )]
+    #[case::naive_iso("2026-11-02T12:00:00.5", "2026-11-02T12:00:00.500")]
+    #[case::naive_space("2026-11-02 12:00:00", "2026-11-02T12:00:00.000")]
+    fn reads_the_timestamps_the_proxy_writes(#[case] text: &str, #[case] expected: &str) {
+        assert_eq!(
+            parse_spend_log_timestamp(text)
+                .map(|parsed| parsed.format("%Y-%m-%dT%H:%M:%S%.3f").to_string()),
+            Some(expected.to_owned())
+        );
+    }
+
+    #[rstest]
+    #[case::unknown_column(json!({"request_id": "bad", "call_type": "x", "startTime": "2026-11-02 12:00:00", "endTime": "2026-11-02 12:00:00", "unexpected": 1}))]
+    #[case::missing_start(json!({"request_id": "bad", "call_type": "x", "endTime": "2026-11-02 12:00:00"}))]
+    #[case::not_a_number(json!({"request_id": "bad", "call_type": "x", "startTime": "2026-11-02 12:00:00", "endTime": "2026-11-02 12:00:00", "spend": "abc"}))]
+    #[case::not_a_time(json!({"request_id": "bad", "call_type": "x", "startTime": "soon", "endTime": "2026-11-02 12:00:00"}))]
+    #[case::null_in_a_required_column(json!({"request_id": "bad", "call_type": "x", "startTime": "2026-11-02 12:00:00", "endTime": "2026-11-02 12:00:00", "model": null}))]
+    fn a_log_the_table_cannot_hold_is_a_rejected_row(#[case] columns: Value) {
+        let error = SpendLogRecord::from_columns(object(columns)).expect_err("refused");
+
+        assert_eq!(error.kind(), ErrorKind::DataRejected);
+    }
+
+    #[rstest]
+    #[case::missing_columns_take_defaults(
+        json!({"request_id": "r", "call_type": "x", "startTime": "2026-11-02 12:00:00", "endTime": "2026-11-02 12:00:00"}),
+        json!({"api_key": "", "model_id": "", "metadata": {}, "request_tags": [], "team_id": null, "created_at": null})
+    )]
+    #[case::explicit_nulls_stay_null(
+        json!({"request_id": "r", "call_type": "x", "startTime": "2026-11-02 12:00:00", "endTime": "2026-11-02 12:00:00", "model_id": null, "metadata": null}),
+        json!({"api_key": "", "model_id": null, "metadata": null, "request_tags": [], "team_id": null, "created_at": null})
+    )]
+    fn parses_a_log_into_its_columns(#[case] columns: Value, #[case] expected: Value) {
+        let stored = serde_json::to_value(record(columns)).expect("serializes");
+
+        for (column, value) in object(expected) {
+            assert_eq!(stored.get(&column), Some(&value), "{column}");
+        }
+    }
+
     fn entry(delivery_id: &str, request_id: &str, logged: bool) -> SpendLogLedgerEntry {
         SpendLogLedgerEntry {
             delivery: SpendLogDelivery {
                 delivery_id: delivery_id.into(),
-                request_id: json!(request_id),
+                request_id: request_id.into(),
                 accounting_payload: object(json!({"request_id": request_id, "spend": 0.5})),
                 is_batch: false,
             },
@@ -323,9 +525,10 @@ mod tests {
         let pool = database_pool?;
         let mut tx = pool.begin().await?;
         let accepted =
-            insert_spend_log_ledger(&mut tx, &ledger, write_spend_logs, NOW, true).await?;
+            insert_spend_log_ledger(&mut tx, &ledger, write_spend_logs, now(), true).await?;
         assert_eq!(accepted, 3);
-        let replay = insert_spend_log_ledger(&mut tx, &ledger, write_spend_logs, NOW, true).await?;
+        let replay =
+            insert_spend_log_ledger(&mut tx, &ledger, write_spend_logs, now(), true).await?;
         assert_eq!(replay, 0);
         let every_id = [
             "delivery-a",
@@ -359,20 +562,22 @@ mod tests {
     ) -> Result<(), Box<dyn StdError>> {
         let pool = database_pool?;
         let mut tx = pool.begin().await?;
-        let mut legacy = row("job-1");
-        legacy.insert("spend".into(), json!(legacy_spend));
-        legacy.insert("status".into(), json!(legacy_status));
-        insert_spend_log_rows(&mut *tx, &[legacy], NOW, true).await?;
+        let legacy = SpendLogRecord {
+            spend: legacy_spend,
+            status: Some(legacy_status.to_owned()),
+            ..row("job-1")
+        };
+        insert_spend_log_rows(&mut *tx, &[legacy], now(), true).await?;
         let job = SpendLogLedgerEntry {
             delivery: SpendLogDelivery {
                 delivery_id: "job-1".into(),
-                request_id: json!("job-1"),
+                request_id: "job-1".into(),
                 accounting_payload: object(json!({"spend": 0.25})),
                 is_batch: true,
             },
             row: Some(row("job-1")),
         };
-        let accepted = insert_spend_log_ledger(&mut tx, &[job], true, NOW, true).await?;
+        let accepted = insert_spend_log_ledger(&mut tx, &[job], true, now(), true).await?;
         assert_eq!(accepted, expected_deliveries.len());
         assert_eq!(
             ids(&mut *tx, DELIVERIES, &["job-1"]).await?,
@@ -397,18 +602,18 @@ mod tests {
         )]
         sqlx::query(
             r#"INSERT INTO "LiteLLM_SpendLogs" (request_id, call_type, "startTime", "endTime", created_at, updated_at)
-               VALUES ('defaults-sql', 'acompletion', '2026-11-02 12:00:00', '2026-11-02 12:00:01', $1::timestamp, $1::timestamp)"#,
+               VALUES ('defaults-sql', 'acompletion', '2026-11-02 12:00:00', '2026-11-02 12:00:01', $1, $1)"#,
         )
-        .bind(NOW)
+        .bind(now())
         .execute(&mut *tx)
         .await?;
-        let minimal = object(json!({
+        let minimal = record(json!({
             "request_id": "defaults-native",
             "call_type": "acompletion",
             "startTime": "2026-11-02 12:00:00",
             "endTime": "2026-11-02 12:00:01",
         }));
-        insert_spend_log_rows(&mut *tx, &[minimal], NOW, true).await?;
+        insert_spend_log_rows(&mut *tx, &[minimal], now(), true).await?;
         let columns = SPEND_LOG_COLUMNS
             .iter()
             .filter(|column| **column != "request_id")
@@ -432,14 +637,12 @@ mod tests {
     }
 
     #[rstest]
-    #[case::unknown_column(json!({"request_id": "bad", "unexpected": 1}), ErrorKind::DataRejected, None)]
-    #[case::invalid_number(json!({"request_id": "bad", "call_type": "x", "startTime": "2026-11-02", "endTime": "2026-11-02", "spend": "abc"}), ErrorKind::DataRejected, Some("22P02"))]
-    #[case::missing_start(json!({"request_id": "bad", "call_type": "x", "endTime": "2026-11-02"}), ErrorKind::DataRejected, Some("23502"))]
+    #[case::non_finite_spend(SpendLogRecord { spend: f64::NAN, ..row("bad") }, Some("23502"))]
+    #[case::nul_in_json(SpendLogRecord { response: Some(json!({"text": "a\u{0}b"})), ..row("bad") }, Some("22P05"))]
     #[tokio::test]
     #[ignore = "requires DATABASE_URL pointing to a Prisma-migrated PostgreSQL database"]
     async fn a_row_postgres_cannot_store_rolls_back_the_whole_ledger(
-        #[case] bad: Value,
-        #[case] kind: ErrorKind,
+        #[case] bad: SpendLogRecord,
         #[case] sqlstate: Option<&str>,
         #[future(awt)] database_pool: Result<PgPool, Box<dyn StdError>>,
     ) -> Result<(), Box<dyn StdError>> {
@@ -447,17 +650,17 @@ mod tests {
         let mut outer = pool.begin().await?;
         let mut tx = sqlx::Acquire::begin(&mut *outer).await?;
         let mut poisoned = entry("delivery-bad", "bad", true);
-        poisoned.row = Some(object(bad));
+        poisoned.row = Some(bad);
         let result = insert_spend_log_ledger(
             &mut tx,
             &[entry("delivery-good", "good", true), poisoned],
             true,
-            NOW,
+            now(),
             true,
         )
         .await;
         let error = result.expect_err("the poisoned row must fail the ledger");
-        assert_eq!(error.kind(), kind);
+        assert_eq!(error.kind(), ErrorKind::DataRejected);
         assert_eq!(error.sqlstate().as_deref(), sqlstate);
         tx.rollback().await?;
         assert!(
