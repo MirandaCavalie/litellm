@@ -2,12 +2,10 @@ use std::collections::BTreeMap;
 
 use litellm_config::{RedisSettings, Value};
 use litellm_env::Lookup;
-use litellm_redis_resolve::{Expected, Kwargs};
 use litellm_redis_types::{ProviderHandle, Resolution};
 use veil::Redact;
 
-use super::{layers, secrets::SecretSnapshot};
-use crate::Error;
+use crate::{Error, Expected, Kwargs, layers, secrets::SecretSnapshot};
 
 const CACHE_ONLY: &[&str] = &[
     "type",
@@ -23,16 +21,16 @@ const CACHE_ONLY: &[&str] = &[
 
 /// The redis-py kwargs one surface hands `_get_redis_client_logic`, before `REDIS_*` and secrets.
 #[derive(Clone, Redact)]
-pub(crate) struct ConfiguredRedis {
+pub struct ConfiguredRedis {
     #[redact(with = "[REDACTED]")]
-    pub(super) fields: BTreeMap<String, Value>,
-    pub(super) nulls: Nulls,
-    pub(super) credential_provider: Option<ProviderHandle>,
+    pub(crate) fields: BTreeMap<String, Value>,
+    pub(crate) nulls: Nulls,
+    pub(crate) credential_provider: Option<ProviderHandle>,
 }
 
 /// Whether a null setting reaches redis-py as an explicit `None`, which outranks its `REDIS_*` value.
 #[derive(Clone, Copy, Debug)]
-pub(super) enum Nulls {
+pub(crate) enum Nulls {
     /// `coordination_redis` reaches redis-py through `model_dump(exclude_none=True)`.
     Dropped,
     /// `Cache` drops a null only for the parameters it names and passes any other key on.
@@ -45,14 +43,12 @@ pub(super) enum Nulls {
 impl ConfiguredRedis {
     /// `general_settings.coordination_redis`, which the proxy validates as a pydantic model first.
     /// An `os.environ/` port is only known after merging, where it is read like any other port.
-    pub(crate) fn coordination(
-        settings: &RedisSettings,
-    ) -> Result<Self, litellm_redis_resolve::Error> {
+    pub fn coordination(settings: &RedisSettings) -> Result<Self, Error> {
         if let Some(port) = settings.fields().get("port").and_then(text)
             && !port.starts_with("os.environ/")
             && port.parse::<u16>().is_err()
         {
-            return Err(litellm_redis_resolve::Error::Invalid {
+            return Err(Error::Invalid {
                 setting: "port".to_owned(),
                 expected: Expected::Integer,
             });
@@ -65,7 +61,7 @@ impl ConfiguredRedis {
     }
 
     /// `litellm_settings.cache_params` with `type: redis`, as `litellm.Cache` hands it to `RedisCache`.
-    pub(crate) fn cache_params(settings: &RedisSettings) -> Self {
+    pub fn cache_params(settings: &RedisSettings) -> Self {
         let fields = settings.fields();
         let alias = fields
             .get("redis_startup_nodes")
@@ -106,7 +102,7 @@ impl ConfiguredRedis {
     }
 
     /// No configured settings, so only `REDIS_*` and the other environment fallbacks apply.
-    pub(crate) fn environment_only() -> Self {
+    pub fn environment_only() -> Self {
         Self {
             fields: BTreeMap::new(),
             nulls: Nulls::Dropped,
@@ -121,20 +117,20 @@ impl ConfiguredRedis {
     }
 
     /// The environment is only for what Python reads straight from `os.environ`, `REDIS_USERNAME` for Azure.
-    pub(crate) fn resolve(
+    pub fn resolve(
         &self,
         secrets: &SecretSnapshot,
         environment: &dyn Lookup,
     ) -> Result<Resolution, Error> {
-        Ok(litellm_redis_resolve::interpret(
+        crate::interpret(
             &self.merged(secrets)?,
             self.credential_provider,
             environment.get("REDIS_USERNAME").as_deref(),
-        )?)
+        )
     }
 }
 
-pub(super) fn text(value: &Value) -> Option<String> {
+fn text(value: &Value) -> Option<String> {
     match value {
         Value::String(text) => Some(text.clone()),
         Value::Number(number) => Some(number.to_string()),

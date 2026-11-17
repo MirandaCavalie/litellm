@@ -6,20 +6,11 @@ use litellm_env::Lookup;
 use litellm_python_compat::flags::{lower_is_true, str_to_bool_or_truthy};
 use litellm_redis_client::{RedisClient, RedisEvents};
 use litellm_redis_connect::{HostServices, RedisHosts, SharedEnvironment, TracingEvents};
-use litellm_redis_resolve::Expected;
+use litellm_redis_resolve::{ConfiguredRedis, Expected, SecretSnapshot};
 use litellm_redis_types::Resolution;
 use serde::Deserialize;
 
 use crate::Error;
-
-mod configured;
-mod layers;
-mod secrets;
-#[cfg(test)]
-mod surface_tests;
-
-use configured::ConfiguredRedis;
-use secrets::SecretSnapshot;
 
 pub(crate) struct Resources {
     pub(crate) http: litellm_http::Client,
@@ -29,6 +20,7 @@ pub(crate) struct Resources {
 const ENVIRONMENT_PING_TIMEOUT: Duration = Duration::from_secs(2);
 type Params = Resolution;
 
+#[derive(Clone, Default)]
 pub struct RedisClients {
     pub coordination: Option<RedisClient>,
     pub transaction_buffer: Option<RedisClient>,
