@@ -7,9 +7,9 @@
 //! The reservation is the caller's own copy, so Rust callers carry it from reconcile to the
 //! counter step themselves.
 //!
-//! Two seams are placeholders until the counter I/O lands in this crate as one Rust entry point:
-//! [`reseed_reserved_counters`] (`reseed_reserved_counter`, a DB read) and [`post_call_counters`]
-//! (`settle_customer_spend` plus `increment_spend_counters`). Both log and do nothing today.
+//! The counter step itself is [`crate::Budgets::charge_counters`]. One seam stays a placeholder:
+//! [`reseed_reserved_counters`] (`reseed_reserved_counter`, a DB read before the spend write),
+//! which only logs; the counter step reseeds a reserved counter it finds cold.
 
 use litellm_callbacks::BudgetReservation;
 use litellm_redis_store::{
@@ -136,7 +136,7 @@ pub async fn release_or_invalidate(
 }
 
 /// Placeholder for the reseed of reserved counters a reconcile found inconsistent, which reads
-/// the entity's spend from the DB. It moves here with the rest of the post-call counter I/O.
+/// the entity's spend from the DB before the spend write.
 pub async fn reseed_reserved_counters(reseeds: &[Reseed]) {
     if !reseeds.is_empty() {
         tracing::debug!(
@@ -144,40 +144,6 @@ pub async fn reseed_reserved_counters(reseeds: &[Reseed]) {
             "reserved counter reseed is not wired in Rust yet"
         );
     }
-}
-
-/// One charged row's post-call counter step: the identities and cost
-/// `increment_spend_counters` and `settle_customer_spend` take.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct PostCallCharge {
-    pub token: Option<String>,
-    pub user_id: Option<String>,
-    pub team_id: Option<String>,
-    pub org_id: Option<String>,
-    pub project_id: Option<String>,
-    pub end_user_id: Option<String>,
-    pub tags: Option<Vec<String>>,
-    pub model_access_groups: Vec<String>,
-    pub response_cost: f64,
-}
-
-/// Placeholder for the post-call counter step (warm checks, reseeds, the batch read, the
-/// increment pipeline and the committed twins), the seam the spend log callback calls once a row
-/// is charged. It moves here as one Rust entry point; until then it only marks the reservation
-/// finalized, as the counter step does when it finishes.
-pub async fn post_call_counters(
-    _budgets: &Budgets,
-    charge: &PostCallCharge,
-    reservation: Option<&mut BudgetReservation>,
-) -> Result<(), EngineError> {
-    tracing::debug!(
-        response_cost = charge.response_cost,
-        "post-call spend counters are not wired in Rust yet"
-    );
-    if let Some(reservation) = reservation {
-        reservation.finalized = Some(true);
-    }
-    Ok(())
 }
 
 #[cfg(test)]

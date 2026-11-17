@@ -19,6 +19,9 @@ from litellm.proxy.auth.auth_object_prefetch import AUTH_OBJECTS_TARGET
 from litellm.proxy.db.db_spend_update_writer import debitable_model_access_groups, get_llm_router
 from litellm.proxy.db.rust_spend_log_writer import rust_spend_log_writer
 from litellm.proxy.hooks.proxy_track_cost_callback import ProxyDBLogger
+from litellm.proxy.spend_tracking.rust_spend_counters import (
+    _CounterHost,  # pyright: ignore[reportPrivateUsage]  # the counter step's host, which the callback's host extends
+)
 from litellm.proxy.spend_tracking.rust_spend_log_rows import decode_row, token_word_ranges
 from litellm.responses.streaming_iterator import spawn_logging_task
 from litellm.rust_bridge._native import NativeSpendCounters, RustSpendLog, RustSpendLogWriter
@@ -81,7 +84,31 @@ async def _proxy_spend(response_cost: float) -> None:
     await add_spend_to_budgeted_global_proxy_spend(user_api_key_cache, response_cost)
 
 
-class SpendLogHost:
+async def _committed_tracked(request: Mapping[str, object]) -> Sequence[str]:
+    from litellm.proxy.proxy_server import spend_counter_store
+    from litellm.proxy.spend_tracking.committed_spend import committed_spend_tracked, warm_committed_counter_keys
+    from litellm.types.proxy.carried_budget_state import EntitySpendCounterKeys
+
+    carried: Final = request.get("committed")
+    if isinstance(carried, list):
+        return _texts(carried)  # pyright: ignore[reportUnknownArgumentType]  # a JSON array from the host request
+    cost: Final = request.get("response_cost")
+    if not isinstance(cost, int | float) or cost <= 0 or not committed_spend_tracked():
+        return []
+    warmed: Final = await warm_committed_counter_keys(
+        spend_counter_store,
+        EntitySpendCounterKeys.of(
+            token=_text(request.get("token")),
+            team_id=_text(request.get("team_id")),
+            user_id=_text(request.get("user_id")),
+            org_id=_text(request.get("org_id")),
+            end_user_id=_text(request.get("end_user_id")),
+        ),
+    )
+    return list(warmed.tracked())
+
+
+class SpendLogHost(_CounterHost):
     async def enrich_key_identity(self, request: Mapping[str, object]) -> Mapping[str, object]:
         metadata: Final[dict[str, object]] = {  # mutable-ok: the enrichment fills it in place
             "user_api_key": request.get("api_key"),
@@ -103,17 +130,19 @@ class SpendLogHost:
             raise TypeError("an accounting context request carries the built row as JSON text")
         row: Final = decode_row(row_text)
         scopes: Final = request.get("customer_scopes")
-        windows: Final = (
-            await accounting_window_keys(
-                _text(request.get("token")),
-                _text(request.get("team_id")),
-                await customer_accounting_counters(
-                    _customer(request.get("customer")), None if scopes is None else _SCOPES.validate_python(scopes)
-                ),
-                user_id=_text(request.get("user_id")),
+        token: Final = _text(request.get("token"))
+        team_id: Final = _text(request.get("team_id"))
+        user_id: Final = _text(request.get("user_id"))
+        charges: Final = request.get("windows") is True
+        customer_counters: Final = (
+            await customer_accounting_counters(
+                _customer(request.get("customer")), None if scopes is None else _SCOPES.validate_python(scopes)
             )
-            if request.get("windows") is True
+            if charges
             else ()
+        )
+        windows: Final = (
+            await accounting_window_keys(token, team_id, customer_counters, user_id=user_id) if charges else ()
         )
         return {
             "windows": json.loads(json.dumps(safe_json_structure(list(windows)))),
@@ -123,6 +152,17 @@ class SpendLogHost:
                     _texts(request.get("model_access_groups")), row["model_id"], get_llm_router()
                 )
             ),
+            "customer_windows": [
+                {
+                    "counter_key": counter.counter_key,
+                    "entity_type": counter.entity_type,
+                    "entity_id": counter.entity_id,
+                    "window_duration": counter.window_duration,
+                    "window_start": None if counter.window_start is None else counter.window_start.isoformat(),
+                }
+                for counter in customer_counters
+            ],
+            "committed_tracked": await _committed_tracked(request),
         }
 
     def increment_proxy_spend(self, request: Mapping[str, object]) -> None:

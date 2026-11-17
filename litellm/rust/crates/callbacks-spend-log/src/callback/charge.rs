@@ -2,7 +2,7 @@
 //! claim or enqueue, then the counters and the host calls, in the cost callback's order.
 
 use litellm_callbacks::{BudgetReservation, Host};
-use litellm_callbacks_budgets::post_call::{self, PostCallCharge};
+use litellm_callbacks_budgets::{CounterStep, CustomerWindow, post_call};
 use litellm_python_compat::{
     Value,
     dict::{Dict, get, get_or_none},
@@ -31,20 +31,33 @@ const ACCOUNTING_ONLY_KEYS: [&str; 4] = [
 const VIDEO_STATUS_CALL_TYPES: [&str; 2] = ["avideo_status", "video_status"];
 const RESPONSES_ID_CALL_TYPES: [&str; 2] = ["aget_responses", "acancel_responses"];
 
-/// What `update_database` did with one row: whether the request is charged, and the model
-/// access groups the served model debits, which the counters reuse.
+/// What `update_database` did with one row: whether the request is charged, and what the
+/// accounting context resolved for the counter step (the model access groups the served model
+/// debits, the customer window counters and the committed twins).
+#[derive(Default)]
 struct Written {
     charged: bool,
     model_access_groups: Vec<String>,
+    customer_windows: Vec<CustomerWindow>,
+    committed_tracked: Option<Vec<String>>,
 }
 
 impl Written {
-    const fn charged() -> Self {
+    fn charged() -> Self {
         Self {
             charged: true,
-            model_access_groups: Vec::new(),
+            ..Self::default()
         }
     }
+}
+
+/// Who and what one charged row's counter step charges.
+struct Charge<'a> {
+    identity: &'a Identity,
+    tags: Option<&'a [String]>,
+    row: &'a RowRequest,
+    cost: f64,
+    customer_hierarchy: bool,
 }
 
 fn sha256_hex(text: &str) -> String {
@@ -347,19 +360,16 @@ impl<S: LedgerStore + 'static> SpendLogCallback<S> {
             self.release(reservation, window_resets).await;
             return false;
         }
-        let charge = PostCallCharge {
-            token: identity.token.clone(),
-            user_id: identity.user_id.clone(),
-            team_id: identity.team_id.clone(),
-            org_id: identity.org_id.clone(),
-            project_id: identity.project_id.clone(),
-            end_user_id: identity.end_user_id.clone(),
-            tags: tags.map(<[String]>::to_vec),
-            model_access_groups: written.model_access_groups,
-            response_cost: cost,
+        let charge = Charge {
+            identity,
+            tags,
+            row,
+            cost,
+            customer_hierarchy: true,
         };
-        if let Err(error) =
-            post_call::post_call_counters(&self.budgets, &charge, reservation.as_mut()).await
+        if let Err(error) = self
+            .count(host, &charge, written, reservation.as_mut(), window_resets)
+            .await
         {
             tracing::error!(%error, "Error in tracking cost callback - the spend counter update failed");
             if let Some(held) = reservation.as_mut() {
@@ -368,6 +378,60 @@ impl<S: LedgerStore + 'static> SpendLogCallback<S> {
             }
         }
         true
+    }
+
+    /// `increment_spend_counters` on the ledger path: the whole post-call counter step in
+    /// `Budgets::charge_counters`, its stamps and finalization copied onto the held reservation.
+    async fn count(
+        &self,
+        host: &Host,
+        charge: &Charge<'_>,
+        written: Written,
+        reservation: Option<&mut BudgetReservation>,
+        window_resets: &[Option<String>],
+    ) -> Result<(), litellm_callbacks_budgets::Failure> {
+        let identity = charge.identity;
+        let step = CounterStep {
+            token: identity.token.clone(),
+            team_id: identity.team_id.clone(),
+            user_id: identity.user_id.clone(),
+            org_id: identity.org_id.clone(),
+            end_user_id: identity.end_user_id.clone(),
+            project_id: identity.project_id.clone(),
+            tags: charge
+                .tags
+                .map(|tags| tags.iter().cloned().map(Some).collect()),
+            model_access_groups: Some(written.model_access_groups.into_iter().map(Some).collect()),
+            response_cost: Some(charge.cost),
+            committed_tracked: written
+                .committed_tracked
+                .or_else(|| charge.row.committed_tracked.clone())
+                .unwrap_or_default(),
+            customer_windows: written.customer_windows,
+            customer_scopes: if charge.customer_hierarchy {
+                charge.row.customer_hierarchy.clone()
+            } else {
+                Vec::new()
+            },
+            window_resets: window_resets.to_vec(),
+        };
+        let outcome = self
+            .budgets
+            .charge_counters(host, None, &step, reservation.as_deref())
+            .await;
+        if let Some(held) = reservation {
+            if let Some(entries) = held.entries.as_mut() {
+                for (entry, stamp) in entries.iter_mut().zip(&outcome.stamps) {
+                    if let (Some(entry), Some(stamp)) = (entry.as_mut(), stamp) {
+                        entry.applied_adjustment = Some(*stamp);
+                    }
+                }
+            }
+            if outcome.finalized {
+                held.finalized = Some(true);
+            }
+        }
+        outcome.error.map_or(Ok(()), Err)
     }
 
     /// `DBSpendUpdateWriter.update_database` on the ledger path. A failure is logged and still
@@ -437,6 +501,10 @@ impl<S: LedgerStore + 'static> SpendLogCallback<S> {
                 customer: request.customer_entities.clone(),
                 customer_scopes: request.customer_scopes.clone(),
                 model_access_groups: request.model_access_groups.clone(),
+                org_id: identity.org_id.clone(),
+                end_user_id: identity.end_user_id.clone(),
+                response_cost: billable,
+                committed: request.committed_tracked.clone(),
             })
             .await?;
         let mut entities = Map::new();
@@ -483,6 +551,8 @@ impl<S: LedgerStore + 'static> SpendLogCallback<S> {
         Ok(Written {
             charged: self.record(finalized, keep).await,
             model_access_groups: accounting.model_access_groups,
+            customer_windows: accounting.customer_windows,
+            committed_tracked: Some(accounting.committed_tracked),
         })
     }
 
@@ -602,26 +672,21 @@ impl<S: LedgerStore + 'static> SpendLogCallback<S> {
                 .await;
             let cost = row.response_cost.unwrap_or(0.0);
             if written.charged && cost > 0.0 {
-                counted.push((cost, written.model_access_groups));
+                counted.push((row, cost, written));
             }
         }
         if disabled {
             return;
         }
-        for (cost, model_access_groups) in counted {
-            let identity = &failure.identity;
-            let charge = PostCallCharge {
-                token: identity.token.clone(),
-                user_id: identity.user_id.clone(),
-                team_id: identity.team_id.clone(),
-                org_id: identity.org_id.clone(),
-                project_id: identity.project_id.clone(),
-                end_user_id: identity.end_user_id.clone(),
-                tags: tags.map(<[String]>::to_vec),
-                model_access_groups,
-                response_cost: cost,
+        for (row, cost, written) in counted {
+            let charge = Charge {
+                identity: &failure.identity,
+                tags,
+                row,
+                cost,
+                customer_hierarchy: false,
             };
-            if let Err(error) = post_call::post_call_counters(&self.budgets, &charge, None).await {
+            if let Err(error) = self.count(host, &charge, written, None, &[]).await {
                 tracing::error!(%error, "Failed to raise spend counters for a failure spend row");
             }
         }

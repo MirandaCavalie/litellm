@@ -24,6 +24,7 @@ from litellm.proxy.hooks.proxy_track_cost_callback import (
     _CAPTURED_IDENTITY_CALL_TYPES,  # pyright: ignore[reportPrivateUsage]  # the cost callback's own call type sets
     _UNATTRIBUTED_TRACKABLE_CALL_TYPES,  # pyright: ignore[reportPrivateUsage]  # the cost callback's own call type sets
     ProxyDBLogger,
+    _committed_spend_scope,  # pyright: ignore[reportPrivateUsage]  # the failure writer's committed twins
     _failure_snapshot_with_guardrails_recorded_after_it,  # pyright: ignore[reportPrivateUsage]  # the failure writer's own rows
     _failure_spend_rows,  # pyright: ignore[reportPrivateUsage]  # the failure writer's own rows
     _get_request_tags_for_cost_tracking,  # pyright: ignore[reportPrivateUsage, reportUnknownVariableType]  # the cost callback's tag read
@@ -47,6 +48,7 @@ from litellm.types.proxy.auth.customer_hierarchy import (
     customer_budget_scopes_from_request,
     customer_hierarchy_ids_from_request,
 )
+from litellm.types.proxy.auth.user_api_key_auth import committed_budget_spend_of_row
 from litellm.utils import (
     get_end_user_id_for_cost_tracking,  # pyright: ignore[reportUnknownVariableType]  # the helper's dict parameter is untyped upstream
 )
@@ -95,8 +97,30 @@ def _window_resets(reservation: object) -> Sequence[str | None]:
     return [reset(entry) for entry in entries] if isinstance(entries, list) else []  # pyright: ignore[reportUnknownVariableType, reportUnknownArgumentType]  # the reservation's entry dicts
 
 
+def _carried_committed(kwargs: Mapping[str, object]) -> Sequence[str] | None:
+    carried: Final = committed_budget_spend_of_row(
+        _mapping(get_litellm_metadata_from_kwargs(dict(kwargs))),  # pyright: ignore[reportUnknownArgumentType]  # the metadata helper returns an untyped dict
+        _mapping(kwargs.get("litellm_params")),
+    )
+    return None if carried is None else list(carried.counter_keys.tracked())
+
+
+def _customer_hierarchy(kwargs: Mapping[str, object]) -> Sequence[Mapping[str, object]]:
+    from litellm.proxy.spend_tracking.rust_spend_counters import (
+        _customer_scopes,  # pyright: ignore[reportPrivateUsage]  # the counter step's own hierarchy reader
+    )
+
+    metadata: Final = _mapping(get_litellm_metadata_from_kwargs(dict(kwargs)))  # pyright: ignore[reportUnknownArgumentType]  # the metadata helper returns an untyped dict
+    return list(_customer_scopes(metadata.get("user_api_key_customer_hierarchy")))
+
+
 def _row(
-    kwargs: Mapping[str, object], response: object, start_time: datetime, end_time: datetime, cost: float | None
+    kwargs: Mapping[str, object],
+    response: object,
+    start_time: datetime,
+    end_time: datetime,
+    cost: float | None,
+    committed: Sequence[str] | None,
 ) -> Mapping[str, object]:
     groups: Final = get_request_model_access_groups(kwargs)
     customer: Final = customer_hierarchy_ids_from_request(kwargs)
@@ -119,6 +143,8 @@ def _row(
         "model_access_groups": list(groups or ()),
         "customer_entities": None if customer is None else dict(customer.entities()),
         "customer_scopes": None if scopes is None else [scope.model_dump(mode="json") for scope in scopes],
+        "committed_tracked": committed,
+        "customer_hierarchy": _customer_hierarchy(kwargs),
     }
 
 
@@ -175,7 +201,7 @@ def spend_log_success_input(args: HookArgs) -> Mapping[str, object] | None:
         "end_user_max_budget": float(end_user_max_budget) if isinstance(end_user_max_budget, int | float) else None,
         "repeat_poll_cost": repeat_poll_cost(call_type, cost, payload) if cost is not None else 0.0,
         "window_resets": _window_resets(budget_reservation_from_metadata(dict(metadata))),
-        "row": _row(kwargs, response, args.start_time, args.end_time, cost),
+        "row": _row(kwargs, response, args.start_time, args.end_time, cost, _carried_committed(kwargs)),
     }
 
 
@@ -330,7 +356,10 @@ def spend_log_failure_input(args: HookArgs) -> Mapping[str, object] | None:
             dict(_mapping(built.get("metadata"))) if built is not None else {},
         ),
         "window_resets": _window_resets(auth.budget_reservation),
-        "rows": [_row(row, exception, start_time, end_time, cost) for cost, row in rows],
+        "rows": [
+            _row(row, exception, start_time, end_time, cost, list(_committed_spend_scope(auth).tracked()))
+            for cost, row in rows
+        ],
     }
 
 

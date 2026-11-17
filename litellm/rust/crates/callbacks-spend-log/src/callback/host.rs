@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use litellm_callbacks::HostCall;
+use litellm_callbacks_budgets::CustomerWindow;
 
 /// `_enrich_failure_metadata_with_key_info`: the key's and team's identity from the auth cache
 /// or DB, for a request whose key carried no user.
@@ -40,7 +41,8 @@ impl HostCall for EnrichKeyIdentity {
 
 /// The accounting inputs that need the auth cache, the DB and the pricing map: the budget
 /// windows of the key, team, user and customer (`accounting_window_keys`), the savings priced
-/// from the built row (`_savings_or_zero`), and the model access groups the served model debits.
+/// from the built row (`_savings_or_zero`), the model access groups the served model debits, and
+/// for the counter step the customer window counters and the committed twins to charge.
 #[derive(Debug, Serialize)]
 pub struct AccountingContext {
     /// The built row, as JSON text.
@@ -52,6 +54,11 @@ pub struct AccountingContext {
     pub customer: Option<Map<String, Value>>,
     pub customer_scopes: Option<Vec<Value>>,
     pub model_access_groups: Vec<String>,
+    pub org_id: Option<String>,
+    pub end_user_id: Option<String>,
+    pub response_cost: Option<f64>,
+    /// The committed twins the request carried; `None` asks the host to warm them.
+    pub committed: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
@@ -60,6 +67,8 @@ pub struct Accounting {
     pub windows: Vec<Value>,
     pub savings: Value,
     pub model_access_groups: Vec<String>,
+    pub customer_windows: Vec<CustomerWindow>,
+    pub committed_tracked: Vec<String>,
 }
 
 impl HostCall for AccountingContext {

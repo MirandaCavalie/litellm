@@ -4,6 +4,7 @@
 //! hook: the proxy flags the writer reads, the identity the request is charged to, and each
 //! row's builder input and cost.
 
+use litellm_callbacks_budgets::CustomerScopeSpend;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -50,6 +51,11 @@ pub struct RowRequest {
     /// `customer_budget_scopes_from_request`, the customer scopes admission granted, each as
     /// its JSON record, or `None` when the request carries no snapshot.
     pub customer_scopes: Option<Vec<Value>>,
+    /// The entity counters whose committed twin the request carried, `None` when it carried
+    /// none and the accounting context decides.
+    pub committed_tracked: Option<Vec<String>>,
+    /// `user_api_key_customer_hierarchy`'s scopes, settled first by the counter step.
+    pub customer_hierarchy: Vec<CustomerScopeSpend>,
 }
 
 /// How the success callback treats a request before any charge.
