@@ -1,10 +1,12 @@
 import asyncio
+import logging
 import selectors
 from collections.abc import Callable, Coroutine, Sequence
 from typing import Final, TypeVar
 
 import pytest
 
+from litellm._logging import verbose_router_logger
 from litellm.router_utils.dynamic_queue import (
     OPERATION_TIMED_OUT,
     AdmitReply,
@@ -321,7 +323,7 @@ async def test_a_trigger_before_the_granted_probe_owner_polls_puts_it_back_in_it
 
     await _congest(backend)
 
-    assert await backend.poll(CAPACITY, "owner") == Waiting()
+    assert await backend.poll(CAPACITY, "owner") == Waiting(probe_in_ms=1_000)
     timer.advance(1.0)
     regranted: Final = await backend.poll(CAPACITY, "owner")
     assert isinstance(regranted, Probe) and regranted.generation == 2
@@ -342,7 +344,7 @@ async def test_a_trigger_after_recovery_folds_unclaimed_waiters_back_with_priori
 
     await _congest(backend)
 
-    assert await backend.poll(CAPACITY, "short-budget") == Waiting()
+    assert await backend.poll(CAPACITY, "short-budget") == Waiting(probe_in_ms=1_000)
     timer.at = 2.0
     assert await backend.poll(CAPACITY, "short-budget") == Waiting()
     assert isinstance(await backend.poll(CAPACITY, "urgent"), Probe)
@@ -575,14 +577,14 @@ class StallsAfterEnqueue:
     def settings(self) -> QueueSettings:
         return self.inner.settings
 
-    async def admit(self, request: WaitRequest, budget_ms: int) -> AdmitReply:
-        _ = await self.inner.admit(request, budget_ms)
+    async def admit(self, request: WaitRequest, budget_ms: int, ready_in_ms: int = 0) -> AdmitReply:
+        _ = await self.inner.admit(request, budget_ms, ready_in_ms)
         self.enqueued.set()
         await asyncio.Event().wait()
         raise AssertionError("unreachable")
 
-    async def poll(self, capacity: str, waiter_id: str) -> PollReply:
-        return await self.inner.poll(capacity, waiter_id)
+    async def poll(self, capacity: str, waiter_id: str, ready_in_ms: int = 0) -> PollReply:
+        return await self.inner.poll(capacity, waiter_id, ready_in_ms)
 
     async def renew(self, capacity: str, waiter_id: str, token: int) -> bool | CoordinationUnavailable:
         return await self.inner.renew(capacity, waiter_id, token)
@@ -659,8 +661,8 @@ class HoldsReleases(StallsAfterEnqueue):
         self.held = asyncio.Event()
         self.release = asyncio.Event()
 
-    async def admit(self, request: WaitRequest, budget_ms: int) -> AdmitReply:
-        return await self.inner.admit(request, budget_ms)
+    async def admit(self, request: WaitRequest, budget_ms: int, ready_in_ms: int = 0) -> AdmitReply:
+        return await self.inner.admit(request, budget_ms, ready_in_ms)
 
     async def report(
         self, capacity: str, waiter_id: str, grant: Grant, outcome: Outcome
@@ -726,10 +728,10 @@ class AnswersOnRelease(StallsAfterEnqueue):
         super().__init__(inner)
         self.release = asyncio.Event()
 
-    async def admit(self, request: WaitRequest, budget_ms: int) -> AdmitReply:
+    async def admit(self, request: WaitRequest, budget_ms: int, ready_in_ms: int = 0) -> AdmitReply:
         self.enqueued.set()
         await self.release.wait()
-        return await self.inner.admit(request, budget_ms)
+        return await self.inner.admit(request, budget_ms, ready_in_ms)
 
 
 async def test_a_probe_granted_after_the_queue_budget_ran_out_is_given_back_as_a_timeout() -> None:
@@ -776,8 +778,8 @@ class NeverReleases(StallsAfterEnqueue):
         super().__init__(inner)
         self.releasing = asyncio.Event()
 
-    async def admit(self, request: WaitRequest, budget_ms: int) -> AdmitReply:
-        return await self.inner.admit(request, budget_ms)
+    async def admit(self, request: WaitRequest, budget_ms: int, ready_in_ms: int = 0) -> AdmitReply:
+        return await self.inner.admit(request, budget_ms, ready_in_ms)
 
     async def abandon(self, capacity: str, waiter_id: str) -> None | CoordinationUnavailable:
         self.releasing.set()
@@ -891,10 +893,10 @@ class NeverAnswersPolls(StallsAfterEnqueue):
         super().__init__(inner)
         self.polled = asyncio.Event()
 
-    async def admit(self, request: WaitRequest, budget_ms: int) -> AdmitReply:
-        return await self.inner.admit(request, budget_ms)
+    async def admit(self, request: WaitRequest, budget_ms: int, ready_in_ms: int = 0) -> AdmitReply:
+        return await self.inner.admit(request, budget_ms, ready_in_ms)
 
-    async def poll(self, capacity: str, waiter_id: str) -> PollReply:
+    async def poll(self, capacity: str, waiter_id: str, ready_in_ms: int = 0) -> PollReply:
         self.polled.set()
         await asyncio.Event().wait()
         raise AssertionError("unreachable")
@@ -904,7 +906,7 @@ class NeverAnswersPolls(StallsAfterEnqueue):
     ("budget_s", "silence_s", "expected"),
     [
         (30.0, 1.0, CoordinationUnavailable(reason=OPERATION_TIMED_OUT)),
-        (1.125, 0.875, QueueTimeout()),
+        (1.125, 0.125, QueueTimeout()),
     ],
     ids=["coordination_gave_out_first", "the_budget_ran_out_first"],
 )
@@ -918,7 +920,7 @@ async def test_an_unanswered_poll_ends_the_wait_as_whichever_limit_ran_out_first
     waiter: Final = asyncio.create_task(DynamicQueue(silent, timer).admit(_request("a"), budget_s))
     try:
         await timer.parked(waiter)
-        timer.advance(0.25)
+        timer.advance(1.0)
         await _signalled(silent.polled)
         await timer.parked()
         timer.advance(silence_s)
@@ -938,13 +940,13 @@ async def test_a_waiter_the_queue_dropped_meanwhile_times_out_instead_of_waiting
     try:
         await timer.parked(waiter)
         await inner.abandon(CAPACITY, "dropped")
-        timer.advance(0.25)
+        timer.advance(1.0)
         result: Final = await _finished(waiter)
     finally:
         await _reap(waiter)
 
     assert isinstance(result, QueueTimeout)
-    assert timer.at == 0.25
+    assert timer.at == 1.0
 
 
 async def test_a_wait_whose_admission_reply_came_after_the_budget_times_out_and_leaves_the_queue() -> None:
@@ -984,8 +986,8 @@ class RecordsLostLeases(StallsAfterEnqueue):
         super().__init__(inner)
         self.lost = asyncio.Event()
 
-    async def admit(self, request: WaitRequest, budget_ms: int) -> AdmitReply:
-        return await self.inner.admit(request, budget_ms)
+    async def admit(self, request: WaitRequest, budget_ms: int, ready_in_ms: int = 0) -> AdmitReply:
+        return await self.inner.admit(request, budget_ms, ready_in_ms)
 
     async def renew(self, capacity: str, waiter_id: str, token: int) -> bool | CoordinationUnavailable:
         renewed: Final = await self.inner.renew(capacity, waiter_id, token)
@@ -1016,3 +1018,272 @@ async def test_a_probe_that_lost_its_lease_stops_renewing_and_never_holds_the_ne
     assert renewing_after_loss == 0
     assert isinstance(next_probe, Probe)
     assert isinstance(await inner.poll(CAPACITY, "third"), Waiting)
+
+
+async def test_a_higher_priority_arrival_outranks_a_waiter_still_cooling_once_both_are_ready() -> None:
+    timer: Final = ManualTimer()
+    backend: Final = _backend(timer)
+    await _congest(backend)
+    timer.at = 1.0
+    assert isinstance(await backend.admit(_request("p1", priority=1), FAR, ready_in_ms=4_000), Waiting)
+    timer.at = 2.0
+    assert isinstance(await backend.admit(_request("p0", priority=0), FAR, ready_in_ms=3_000), Waiting)
+
+    timer.at = 4.5
+    cooling: Final = {
+        "p1": await backend.poll(CAPACITY, "p1", ready_in_ms=500),
+        "p0": await backend.poll(CAPACITY, "p0", ready_in_ms=500),
+    }
+    timer.at = 5.0
+    p1_turn: Final = await backend.poll(CAPACITY, "p1", ready_in_ms=0)
+    p0_turn: Final = await backend.poll(CAPACITY, "p0", ready_in_ms=0)
+
+    assert cooling == {"p1": Waiting(), "p0": Waiting()}
+    assert p1_turn == Waiting()
+    assert isinstance(p0_turn, Probe)
+
+
+async def test_a_ready_waiter_is_granted_ahead_of_a_higher_priority_one_its_deployment_still_cools() -> None:
+    timer: Final = ManualTimer()
+    backend: Final = _backend(timer)
+    await _congest(backend)
+    timer.at = 1.0
+    _ = await backend.admit(_request("cooling-p0", priority=0), FAR, ready_in_ms=10_000)
+
+    ready_p5: Final = await backend.admit(_request("ready-p5", priority=5), FAR)
+
+    assert isinstance(ready_p5, Probe)
+
+
+async def test_a_refreshed_cooldown_puts_an_unclaimed_probe_back_in_its_place_without_a_new_generation() -> None:
+    timer: Final = ManualTimer()
+    backend: Final = _backend(timer)
+    await _congest(backend)
+    await _enqueue(backend, ("owner", 0), ("later", 1))
+    timer.at = 1.0
+    assert await backend.poll(CAPACITY, "later", ready_in_ms=5_000) == Waiting()
+
+    refreshed: Final = await backend.poll(CAPACITY, "owner", ready_in_ms=2_000)
+    timer.at = 3.0
+    owner_turn: Final = await backend.poll(CAPACITY, "owner")
+
+    assert refreshed == Waiting()
+    assert isinstance(owner_turn, Probe) and owner_turn.generation == 1
+
+
+async def test_a_matching_failure_between_the_readiness_read_and_the_claim_is_never_dispatched() -> None:
+    timer: Final = ManualTimer()
+    backend: Final = _backend(timer)
+    await _congest(backend)
+    await _enqueue(backend, ("owner", 0))
+    timer.at = 1.0
+
+    await _congest(backend)
+    after_failure: Final = await backend.poll(CAPACITY, "owner", ready_in_ms=0)
+
+    assert after_failure == Waiting(probe_in_ms=1_000)
+
+
+async def test_a_recovery_snapshot_admits_its_first_ready_member_and_keeps_a_cooling_ones_place() -> None:
+    timer: Final = ManualTimer()
+    backend: Final = _backend(timer, required_successes=1)
+    await _recovered(timer, backend, ("first", 1), ("second", 2))
+
+    first_cooling: Final = await backend.poll(CAPACITY, "first", ready_in_ms=2_000)
+    second: Final = await backend.poll(CAPACITY, "second")
+    timer.at = 3.0
+    first: Final = await backend.poll(CAPACITY, "first")
+
+    assert first_cooling == Waiting(ahead=0)
+    assert isinstance(second, Released)
+    assert isinstance(first, Released)
+
+
+async def test_a_controller_wait_stays_queued_until_its_readiness_ends() -> None:
+    timer: Final = ManualTimer()
+    backend: Final = _backend(timer, recheck_ms=250)
+    await _congest(backend)
+    queue: Final = DynamicQueue(backend, timer)
+
+    async def cooling_until_five() -> float:
+        return max(5.0 - timer.now(), 0.0)
+
+    admitted: Final = await _run(timer, queue.admit(_request("waiter"), 30.0, cooling_until_five), 0.25)
+
+    assert isinstance(admitted, Admitted) and isinstance(admitted.grant, Probe)
+    assert timer.at == 5.0
+
+
+COOLING_AHEAD: Final = 70
+
+
+async def test_a_ready_waiter_behind_more_cooling_waiters_than_one_sweep_still_gets_the_probe() -> None:
+    timer: Final = ManualTimer()
+    backend: Final = _backend(timer)
+    await _congest(backend)
+    timer.at = 1.0
+    cooling: Final = [
+        await backend.admit(_request(f"cooling-{index}", priority=0), FAR, ready_in_ms=FAR)
+        for index in range(COOLING_AHEAD)
+    ]
+
+    ready: Final = await backend.admit(_request("ready", priority=9), FAR)
+
+    assert all(reply == Waiting() for reply in cooling)
+    assert isinstance(ready, Probe)
+
+
+async def test_a_ready_snapshot_member_behind_more_cooling_members_than_one_sweep_still_claims() -> None:
+    timer: Final = ManualTimer()
+    backend: Final = _backend(timer, required_successes=1)
+    await _congest(backend)
+    _ = await backend.admit(_request("prober", priority=-1), FAR)
+    for index in range(COOLING_AHEAD):
+        _ = await backend.admit(_request(f"cooling-{index}", priority=0), FAR, ready_in_ms=FAR)
+    _ = await backend.admit(_request("ready", priority=9), FAR)
+    timer.at = 1.0
+    probe: Final = await backend.poll(CAPACITY, "prober")
+    assert isinstance(probe, Probe)
+    await backend.report(CAPACITY, "prober", probe, Succeeded())
+
+    claimed: Final = await backend.poll(CAPACITY, "ready")
+
+    assert isinstance(claimed, Released)
+
+
+class CountsAdmits(StallsAfterEnqueue):
+    def __init__(self, inner: LocalQueueBackend) -> None:
+        super().__init__(inner)
+        self.admits = 0
+
+    async def admit(self, request: WaitRequest, budget_ms: int, ready_in_ms: int = 0) -> AdmitReply:
+        self.admits += 1
+        return await self.inner.admit(request, budget_ms, ready_in_ms)
+
+
+def _readiness_lookup_taking(timer: ManualTimer, seconds: float) -> "Callable[[], Coroutine[object, object, float]]":
+    async def lookup() -> float:
+        timer.at += seconds
+        return 0.0
+
+    return lookup
+
+
+async def test_a_readiness_lookup_that_used_up_the_budget_times_out_before_admitting() -> None:
+    timer: Final = ManualTimer()
+    inner: Final = _backend(timer)
+    await _congest(inner, retry_after_ms=FAR)
+    counting: Final = CountsAdmits(inner)
+
+    result: Final = await DynamicQueue(counting, timer).admit(
+        _request("late"), 0.125, _readiness_lookup_taking(timer, 0.125)
+    )
+
+    assert isinstance(result, QueueTimeout)
+    assert counting.admits == 0
+    assert timer.at == 0.125
+
+
+async def test_a_poll_after_a_slow_readiness_lookup_only_gets_the_time_that_is_left() -> None:
+    timer: Final = ManualTimer()
+    inner: Final = _backend(timer, recheck_ms=250, operation_timeout_ms=1_000)
+    await _congest(inner, retry_after_ms=FAR)
+    silent: Final = NeverAnswersPolls(inner)
+    waiter: Final = asyncio.create_task(
+        DynamicQueue(silent, timer).admit(_request("a"), 2.0, _readiness_lookup_taking(timer, 0.125))
+    )
+    try:
+        await timer.parked(waiter)
+        assert timer.at == 0.125
+        timer.advance(1.0)
+        await _signalled(silent.polled)
+        await timer.parked()
+        timer.advance(0.75)
+        result: Final = await _finished(waiter)
+    finally:
+        await _reap(waiter)
+
+    assert isinstance(result, QueueTimeout)
+    assert timer.at == 2.0
+
+
+class RecordsPolls(StallsAfterEnqueue):
+    def __init__(self, inner: LocalQueueBackend, timer: ManualTimer) -> None:
+        super().__init__(inner)
+        self._timer = timer
+        self.polled_at: list[float] = []  # mutable-ok: when each poll reached the backend
+
+    async def admit(self, request: WaitRequest, budget_ms: int, ready_in_ms: int = 0) -> AdmitReply:
+        return await self.inner.admit(request, budget_ms, ready_in_ms)
+
+    async def poll(self, capacity: str, waiter_id: str, ready_in_ms: int = 0) -> PollReply:
+        self.polled_at.append(self._timer.now())
+        return await self.inner.poll(capacity, waiter_id, ready_in_ms)
+
+
+@pytest.mark.parametrize(
+    ("budget_s", "settled_at", "polls"),
+    [(30.0, 20.0, 20), (2.5, 2.5, 2)],
+    ids=["probe_comes_due", "budget_runs_out_first"],
+)
+async def test_a_wait_behind_a_long_probe_backoff_polls_once_a_second_and_never_past_the_probe_or_its_budget(
+    budget_s: float, settled_at: float, polls: int
+) -> None:
+    timer: Final = ManualTimer()
+    inner: Final = _backend(timer, recheck_ms=250)
+    await _congest(inner, retry_after_ms=20_000)
+    recorder: Final = RecordsPolls(inner, timer)
+
+    result: Final = await _run(timer, DynamicQueue(recorder, timer).admit(_request("a"), budget_s), 0.25)
+
+    gaps: Final = [later - earlier for earlier, later in zip((0.0, *recorder.polled_at), recorder.polled_at)]
+    assert isinstance(result, Admitted if budget_s > settled_at else QueueTimeout)
+    assert timer.at == settled_at
+    assert len(recorder.polled_at) == polls
+    assert max(gaps) <= 1.0
+
+
+async def test_a_wait_behind_a_probe_that_is_out_keeps_rechecking_so_its_recovery_releases_it_at_once() -> None:
+    timer: Final = ManualTimer()
+    inner: Final = _backend(timer, required_successes=1, recheck_ms=250)
+    await _congest(inner, retry_after_ms=20_000)
+    timer.at = 20.0
+    probe: Final = await inner.admit(_request("prober"), FAR)
+    assert isinstance(probe, Probe)
+    waiter: Final = asyncio.create_task(DynamicQueue(inner, timer).admit(_request("behind"), 30.0))
+    try:
+        await timer.parked(waiter)
+        await inner.report(CAPACITY, "prober", probe, Succeeded())
+        timer.advance(0.25)
+        released: Final = await _finished(waiter)
+    finally:
+        await _reap(waiter)
+
+    assert isinstance(released, Admitted) and isinstance(released.grant, Released)
+    assert timer.at == 20.25
+
+
+async def test_a_wait_whose_poll_goes_unanswered_logs_why_and_after_how_long_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    timer: Final = ManualTimer()
+    inner: Final = _backend(timer, operation_timeout_ms=1_000, recheck_ms=250)
+    await _congest(inner, retry_after_ms=FAR)
+    silent: Final = NeverAnswersPolls(inner)
+    with caplog.at_level(logging.DEBUG, logger=verbose_router_logger.name):
+        waiter: Final = asyncio.create_task(DynamicQueue(silent, timer).admit(_request("a"), 30.0))
+        try:
+            await timer.parked(waiter)
+            timer.advance(1.0)
+            await _signalled(silent.polled)
+            await timer.parked()
+            timer.advance(1.0)
+            result: Final = await _finished(waiter)
+        finally:
+            await _reap(waiter)
+
+    logged: Final = [record.getMessage() for record in caplog.records if "dynamic queue" in record.getMessage()]
+    assert result == CoordinationUnavailable(reason=OPERATION_TIMED_OUT)
+    assert logged == [
+        "dynamic queue: coordination failed (operation_timed_out) after 2.000s waiting, going on without the queue"
+    ]

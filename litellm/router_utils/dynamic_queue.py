@@ -10,13 +10,17 @@ gone the capacity is healthy again. Another matching failure folds unclaimed wai
 
 import asyncio
 import bisect
+import math
 import time
-from collections.abc import Callable, Coroutine
+from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass, replace
 from types import TracebackType
 from typing import Final, Protocol, TypeAlias, TypeVar
 
+from litellm._logging import verbose_router_logger
+
 OPERATION_TIMED_OUT: Final = "operation_timed_out"
+_PROBE_RECHECK_CAP_MS: Final = 1_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +60,7 @@ Grant: TypeAlias = PassThrough | Probe | Released
 @dataclass(frozen=True, slots=True)
 class Waiting:
     ahead: int | None = None
+    probe_in_ms: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,9 +126,9 @@ class QueueBackend(Protocol):
     @property
     def settings(self) -> QueueSettings: ...
 
-    async def admit(self, request: WaitRequest, budget_ms: int) -> AdmitReply: ...
+    async def admit(self, request: WaitRequest, budget_ms: int, ready_in_ms: int = 0) -> AdmitReply: ...
 
-    async def poll(self, capacity: str, waiter_id: str) -> PollReply: ...
+    async def poll(self, capacity: str, waiter_id: str, ready_in_ms: int = 0) -> PollReply: ...
 
     async def renew(self, capacity: str, waiter_id: str, token: int) -> bool | CoordinationUnavailable: ...
 
@@ -132,6 +137,9 @@ class QueueBackend(Protocol):
     ) -> None | CoordinationUnavailable: ...
 
     async def abandon(self, capacity: str, waiter_id: str) -> None | CoordinationUnavailable: ...
+
+
+Readiness: TypeAlias = Callable[[], Awaitable[float]]
 
 
 class Timer(Protocol):
@@ -271,16 +279,26 @@ class DynamicQueue:
         self._backend = backend
         self._timer = timer or MonotonicTimer()
 
-    async def admit(self, request: WaitRequest, budget_s: float) -> Admitted | Rejection:
+    async def admit(
+        self, request: WaitRequest, budget_s: float, readiness: Readiness | None = None
+    ) -> Admitted | Rejection:
         """Wait for ``request``'s turn on its capacity for at most ``budget_s``, the queue time the request has left.
         ``Admitted.remaining_s`` is what a later wait of the same request may still spend. A healthy capacity admits
-        even with no budget left; a congested one never grants past the budget."""
-        deadline: Final = self._timer.now() + max(budget_s, 0.0)
+        even with no budget left; a congested one never grants past the budget. ``readiness``, read before every
+        admit and poll, is how many seconds this waiter must still wait before it may be granted."""
+        started: Final = self._timer.now()
+        deadline: Final = started + max(budget_s, 0.0)
         try:
-            settled: Final = await self._settle(request, deadline)
+            settled: Final = await self._settle(request, deadline, readiness)
         except BaseException:
             await self._abandon(request)
             raise
+        if isinstance(settled, CoordinationUnavailable):
+            verbose_router_logger.debug(
+                "dynamic queue: coordination failed (%s) after %.3fs waiting, going on without the queue",
+                settled.reason,
+                self._timer.now() - started,
+            )
         if isinstance(settled, (QueueTimeout, CoordinationUnavailable)):
             await self._abandon(request)
         if isinstance(settled, (QueueTimeout, QueueFull, CoordinationUnavailable)):
@@ -292,6 +310,11 @@ class DynamicQueue:
 
     def _delay(self, waiting: Waiting) -> float:
         settings: Final = self._backend.settings
+        if waiting.ahead is None and waiting.probe_in_ms is not None:
+            # liveness renews when Redis runs a poll: the last reply, the readiness read and the next request can each
+            # take up to an operation timeout on top of the sleep
+            alive_ms: Final = settings.liveness_ms - 3 * settings.operation_timeout_ms
+            return max(settings.recheck_ms, min(waiting.probe_in_ms, _PROBE_RECHECK_CAP_MS, alive_ms)) / 1000
         if waiting.ahead is None:
             return settings.recheck_ms / 1000
         return min(settings.recheck_ms, settings.claim_step_ms * (waiting.ahead + 1)) / 1000
@@ -304,24 +327,51 @@ class DynamicQueue:
         late: Final = isinstance(grant, (Probe, Released)) and self._timer.now() >= deadline
         return QueueTimeout() if late else grant
 
-    async def _settle(self, request: WaitRequest, deadline: float) -> Grant | Rejection:
-        budget_ms: Final = max(int((deadline - self._timer.now()) * 1000), 0)
-        first: Final = await self._within(self._backend.admit(request, budget_ms), _operation_s(self._backend))
+    async def _ready_in_ms(self, readiness: Readiness | None, bound_s: float) -> int | None:
+        """None when ``readiness`` could not be read within ``bound_s``."""
+        if readiness is None or bound_s <= 0:
+            return 0
+
+        async def read() -> float:
+            return await readiness()
+
+        try:
+            left_s: Final = await self._within(read(), bound_s)
+        except Exception:  # noqa: BLE001  # an unreadable readiness is a coordination failure, never a free pass
+            return None
+        return None if left_s is None else max(math.ceil(left_s * 1000), 0)
+
+    async def _settle(self, request: WaitRequest, deadline: float, readiness: Readiness | None) -> Grant | Rejection:
+        operation_s: Final = _operation_s(self._backend)
+        budget_s: Final = deadline - self._timer.now()
+        ready_in_ms: Final = await self._ready_in_ms(readiness, min(operation_s, budget_s))
+        if ready_in_ms is None:
+            return QueueTimeout() if budget_s < operation_s else CoordinationUnavailable(reason=OPERATION_TIMED_OUT)
+        left: Final = deadline - self._timer.now()
+        if budget_s > 0 and left <= 0:
+            return QueueTimeout()
+        bound_s: Final = operation_s if budget_s <= 0 else min(operation_s, left)
+        budget_ms: Final = max(int(left * 1000), 0)
+        first: Final = await self._within(self._backend.admit(request, budget_ms, ready_in_ms), bound_s)
         if first is None:
-            return CoordinationUnavailable(reason=OPERATION_TIMED_OUT)
+            return QueueTimeout() if bound_s < operation_s else CoordinationUnavailable(reason=OPERATION_TIMED_OUT)
         if isinstance(first, Gone):
             return QueueTimeout()
         if isinstance(first, Waiting):
-            return await self._wait(request, deadline, first)
+            return await self._wait(request, deadline, first, readiness)
         return self._in_time(first, deadline)
 
-    async def _wait(self, request: WaitRequest, deadline: float, waiting: Waiting) -> Grant | Rejection:
+    async def _wait(
+        self, request: WaitRequest, deadline: float, waiting: Waiting, readiness: Readiness | None
+    ) -> Grant | Rejection:
         reply: Grant | Rejection | Waiting = waiting  # rebind-ok: each poll's reply decides whether to wait on
         while isinstance(reply, Waiting):
-            reply = await self._recheck(request, deadline, reply)
+            reply = await self._recheck(request, deadline, reply, readiness)
         return reply
 
-    async def _recheck(self, request: WaitRequest, deadline: float, waiting: Waiting) -> Grant | Rejection | Waiting:
+    async def _recheck(
+        self, request: WaitRequest, deadline: float, waiting: Waiting, readiness: Readiness | None
+    ) -> Grant | Rejection | Waiting:
         """One recheck: sleeps as long as ``waiting`` asks, within the deadline, then polls once."""
         remaining: Final = deadline - self._timer.now()
         if remaining <= 0:
@@ -331,11 +381,18 @@ class DynamicQueue:
         if left <= 0:
             return QueueTimeout()
         operation_s: Final = _operation_s(self._backend)
+        ready_in_ms: Final = await self._ready_in_ms(readiness, min(operation_s, left))
+        if ready_in_ms is None:
+            return QueueTimeout() if left < operation_s else CoordinationUnavailable(reason=OPERATION_TIMED_OUT)
+        refreshed: Final = deadline - self._timer.now()
+        if refreshed <= 0:
+            return QueueTimeout()
+        bound_s: Final = min(operation_s, refreshed)
         polled: Final = await self._within(
-            self._backend.poll(request.capacity, request.waiter_id), min(operation_s, left)
+            self._backend.poll(request.capacity, request.waiter_id, ready_in_ms), bound_s
         )
         if polled is None:
-            return QueueTimeout() if left < operation_s else CoordinationUnavailable(reason=OPERATION_TIMED_OUT)
+            return QueueTimeout() if bound_s < operation_s else CoordinationUnavailable(reason=OPERATION_TIMED_OUT)
         if isinstance(polled, Gone):
             return QueueTimeout()
         if isinstance(polled, Waiting):
@@ -353,6 +410,7 @@ class _Waiter:
     priority: int
     seq: int
     deadline_ms: int
+    ready_ms: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -420,16 +478,42 @@ def _sweep(capacity: _Capacity, now: int) -> _Capacity:
     return replace(kept, queue=_live(kept.queue, now), snapshot=_live(kept.snapshot, now))
 
 
+def _first_ready(waiters: tuple[_Waiter, ...], now: int) -> int | None:
+    return next((at for at, waiter in enumerate(waiters) if waiter.ready_ms <= now), None)
+
+
 def _grant_probe(capacity: _Capacity, now: int, settings: QueueSettings) -> _Capacity:
-    if not capacity.congested or capacity.lease is not None or now < capacity.next_probe_ms or not capacity.queue:
+    if not capacity.congested or capacity.lease is not None or now < capacity.next_probe_ms:
+        return capacity
+    at: Final = _first_ready(capacity.queue, now)
+    if at is None:
         return capacity
     token: Final = capacity.tokens + 1
     return replace(
         capacity,
         tokens=token,
-        lease=_Lease(waiter=capacity.queue[0], token=token, until_ms=now + settings.lease_ms, claimed=False),
-        queue=capacity.queue[1:],
+        lease=_Lease(waiter=capacity.queue[at], token=token, until_ms=now + settings.lease_ms, claimed=False),
+        queue=(*capacity.queue[:at], *capacity.queue[at + 1 :]),
     )
+
+
+def _readied(waiters: tuple[_Waiter, ...], waiter_id: str, ready_ms: int) -> tuple[_Waiter, ...]:
+    return tuple(replace(waiter, ready_ms=ready_ms) if waiter.waiter_id == waiter_id else waiter for waiter in waiters)
+
+
+def _with_readiness(capacity: _Capacity, now: int, waiter_id: str, ready_in_ms: int) -> _Capacity:
+    """The waiter may be granted only from ``now + ready_in_ms``. An unclaimed probe it can no longer use goes back to
+    its place, with its priority, sequence and deadline, and with no new generation."""
+    ready_ms: Final = now + ready_in_ms
+    lease: Final = capacity.lease
+    readied: Final = replace(
+        capacity,
+        queue=_readied(capacity.queue, waiter_id, ready_ms),
+        snapshot=_readied(capacity.snapshot, waiter_id, ready_ms),
+    )
+    if lease is None or lease.claimed or lease.waiter.waiter_id != waiter_id or ready_ms <= now:
+        return readied
+    return replace(readied, lease=None, queue=_queued(readied.queue, replace(lease.waiter, ready_ms=ready_ms)))
 
 
 def _claim_probe(
@@ -490,7 +574,7 @@ def _waiting(capacity: _Capacity) -> int:
 
 
 def _admit(
-    capacity: _Capacity, now: int, settings: QueueSettings, request: WaitRequest, budget_ms: int
+    capacity: _Capacity, now: int, settings: QueueSettings, request: WaitRequest, budget_ms: int, ready_in_ms: int
 ) -> tuple[_Capacity, AdmitReply]:
     swept: Final = _sweep(capacity, now)
     if swept.healthy:
@@ -499,7 +583,7 @@ def _admit(
         return swept, Gone()
     if _waiting(swept) >= settings.max_waiting:
         return swept, QueueFull()
-    waiter: Final = _Waiter(request.waiter_id, request.priority, swept.seq + 1, now + budget_ms)
+    waiter: Final = _Waiter(request.waiter_id, request.priority, swept.seq + 1, now + budget_ms, now + ready_in_ms)
     queued: Final = replace(swept, seq=waiter.seq, queue=_queued(swept.queue, waiter))
     if not queued.congested:
         return queued, Waiting(ahead=len(queued.snapshot))
@@ -510,17 +594,23 @@ def _settle_congested(
     capacity: _Capacity, now: int, settings: QueueSettings, waiter_id: str
 ) -> tuple[_Capacity, Probe | Waiting]:
     claimed: Final = _claim_probe(capacity, now, settings, waiter_id)
-    return (capacity, Waiting()) if claimed is None else claimed
+    if claimed is not None:
+        return claimed
+    probe_in_ms: Final = capacity.next_probe_ms - now
+    unleased: Final = capacity.lease is None and probe_in_ms > 0
+    return capacity, Waiting(probe_in_ms=probe_in_ms if unleased else None)
 
 
-def _poll(capacity: _Capacity, now: int, settings: QueueSettings, waiter_id: str) -> tuple[_Capacity, PollReply]:
-    swept: Final = _sweep(capacity, now)
+def _poll(
+    capacity: _Capacity, now: int, settings: QueueSettings, waiter_id: str, ready_in_ms: int
+) -> tuple[_Capacity, PollReply]:
+    swept: Final = _with_readiness(_sweep(capacity, now), now, waiter_id, ready_in_ms)
     claimed: Final = _claim_probe(swept, now, settings, waiter_id)
     if claimed is not None:
         return claimed
     position: Final = next((at for at, waiter in enumerate(swept.snapshot) if waiter.waiter_id == waiter_id), None)
-    if position == 0:
-        return replace(swept, snapshot=swept.snapshot[1:]), Released(swept.generation)
+    if position is not None and position == _first_ready(swept.snapshot, now):
+        return replace(swept, snapshot=_without(swept.snapshot, waiter_id)), Released(swept.generation)
     if position is not None:
         return swept, Waiting(ahead=position)
     if all(waiter.waiter_id != waiter_id for waiter in swept.queue):
@@ -644,11 +734,13 @@ class LocalQueueBackend:
         self._capacities[capacity] = _Kept(updated, _horizon_ms(updated, now) + self._settings.state_ttl_ms)
         return reply
 
-    async def admit(self, request: WaitRequest, budget_ms: int) -> AdmitReply:
-        return self._step(request.capacity, lambda state, now: _admit(state, now, self._settings, request, budget_ms))
+    async def admit(self, request: WaitRequest, budget_ms: int, ready_in_ms: int = 0) -> AdmitReply:
+        return self._step(
+            request.capacity, lambda state, now: _admit(state, now, self._settings, request, budget_ms, ready_in_ms)
+        )
 
-    async def poll(self, capacity: str, waiter_id: str) -> PollReply:
-        return self._step(capacity, lambda state, now: _poll(state, now, self._settings, waiter_id))
+    async def poll(self, capacity: str, waiter_id: str, ready_in_ms: int = 0) -> PollReply:
+        return self._step(capacity, lambda state, now: _poll(state, now, self._settings, waiter_id, ready_in_ms))
 
     async def renew(self, capacity: str, waiter_id: str, token: int) -> bool:
         return self._step(capacity, lambda state, now: _renew(state, now, self._settings, waiter_id, token))

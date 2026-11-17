@@ -1,7 +1,9 @@
+import asyncio
 import os
 import uuid
 from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from contextlib import AsyncExitStack
+from types import MappingProxyType
 from typing import Final
 
 import pytest
@@ -10,20 +12,30 @@ from redis import Redis
 
 from litellm.caching.redis_cache import RedisCache
 from litellm.router_utils.dynamic_queue import (
+    AdmitReply,
+    Admitted,
+    CoordinationUnavailable,
+    DynamicQueue,
     Gone,
+    Grant,
+    LocalQueueBackend,
     MatchingFailure,
     OtherFailure,
+    Outcome,
     PassThrough,
     PollReply,
     Probe,
     QueueFull,
     QueueSettings,
+    Rejection,
     Released,
     Succeeded,
     Waiting,
     WaitRequest,
 )
 from litellm.router_utils.dynamic_queue_redis import RedisQueueBackend, _keys
+from litellm.router_utils.dynamic_queue_router import MAX_WAITING_LIMIT
+from tests.unit.router_utils.test_dynamic_queue import ManualTimer, _reap
 
 FAR: Final = 1_000_000
 
@@ -38,16 +50,29 @@ class SharedClock:
         return self.ms
 
 
+def _delete(*keys: str) -> None:
+    with Redis(host=os.environ["REDIS_HOST"], port=int(os.environ["REDIS_PORT"])) as client:
+        _ = client.delete(*keys)
+
+
 class WorkerFactory:
     def __init__(self, cleanup: AsyncExitStack) -> None:
         self._cleanup = cleanup
+        self._capacity_keys: tuple[str, ...] = ()
 
-    def __call__(self, clock: SharedClock | None, **overrides: int) -> RedisQueueBackend:
+    def owns(self, capacity: str) -> None:
+        """Namespaced workers built after this delete ``capacity``'s keys under their namespace on teardown."""
+        self._capacity_keys = _keys(capacity)
+
+    def __call__(self, clock: SharedClock | None, namespace: str | None = None, **overrides: int) -> RedisQueueBackend:
         cache: Final = RedisCache(
             host=os.environ["REDIS_HOST"],
             port=int(os.environ["REDIS_PORT"]),
             client_name=f"dynamic-queue-test-{uuid.uuid4()}",
+            namespace=namespace,
         )
+        if namespace is not None:
+            self._cleanup.callback(_delete, *(cache.check_and_fix_namespace(key=key) for key in self._capacity_keys))
         self._cleanup.push_async_callback(cache.disconnect)
         client: Final = cache.init_async_client()
         self._cleanup.push_async_callback(client.aclose)
@@ -342,7 +367,7 @@ async def test_a_trigger_before_the_granted_probe_owner_polls_puts_it_back_in_it
 
     await _congest(second, capacity)
 
-    assert await first.poll(capacity, "owner") == Waiting()
+    assert await first.poll(capacity, "owner") == Waiting(probe_in_ms=1_000)
     clock.ms = 2_000
     assert await second.poll(capacity, "later") == Waiting()
     regranted: Final = await first.poll(capacity, "owner")
@@ -365,7 +390,7 @@ async def test_a_trigger_after_recovery_folds_unclaimed_waiters_back_with_priori
 
     await _congest(second, capacity)
 
-    assert await first.poll(capacity, "short-budget") == Waiting()
+    assert await first.poll(capacity, "short-budget") == Waiting(probe_in_ms=1_000)
     clock.ms = 2_000
     assert await first.poll(capacity, "short-budget") == Waiting()
     assert isinstance(await second.poll(capacity, "urgent"), Probe)
@@ -430,3 +455,301 @@ async def test_congestion_outlives_a_retry_after_longer_than_the_idle_ttl_and_th
 
     assert 900_000 < congested_ttl <= 960_000
     assert 0 < recovered_ttl <= 60_000
+
+
+@pytest.mark.asyncio
+async def test_a_shared_capacity_is_shared_within_one_redis_namespace_and_never_across_two(
+    capacity: str, workers: WorkerFactory
+) -> None:
+    clock: Final = SharedClock()
+    shared: Final = f"shared:{capacity}"
+    workers.owns(shared)
+    congesting: Final = workers(clock, namespace=f"router-a-{capacity}")
+    same_router: Final = workers(clock, namespace=f"router-a-{capacity}")
+    other_router: Final = workers(clock, namespace=f"router-b-{capacity}")
+    await _congest(congesting, shared)
+
+    assert isinstance(await same_router.admit(WaitRequest(shared, "same-namespace", 0), FAR), Waiting)
+    assert isinstance(await other_router.admit(WaitRequest(shared, "other-namespace", 0), FAR), PassThrough)
+
+
+@pytest.mark.asyncio
+async def test_a_higher_priority_arrival_outranks_a_waiter_still_cooling_on_another_worker(
+    capacity: str, workers: WorkerFactory
+) -> None:
+    clock: Final = SharedClock()
+    first, second = workers.pair(clock, liveness_ms=FAR)
+    await _congest(first, capacity)
+    clock.ms = 1_000
+    assert isinstance(await first.admit(WaitRequest(capacity, "p1", 1), FAR, ready_in_ms=4_000), Waiting)
+    clock.ms = 2_000
+    assert isinstance(await second.admit(WaitRequest(capacity, "p0", 0), FAR, ready_in_ms=3_000), Waiting)
+
+    clock.ms = 4_500
+    cooling: Final = (
+        await first.poll(capacity, "p1", ready_in_ms=500),
+        await second.poll(capacity, "p0", ready_in_ms=500),
+    )
+    clock.ms = 5_000
+    p1_turn: Final = await first.poll(capacity, "p1", ready_in_ms=0)
+    p0_turn: Final = await second.poll(capacity, "p0", ready_in_ms=0)
+
+    assert cooling == (Waiting(), Waiting())
+    assert p1_turn == Waiting()
+    assert isinstance(p0_turn, Probe)
+
+
+@pytest.mark.asyncio
+async def test_a_refreshed_cooldown_puts_an_unclaimed_probe_back_in_its_place(
+    capacity: str, workers: WorkerFactory
+) -> None:
+    clock: Final = SharedClock()
+    first, second = workers.pair(clock, liveness_ms=FAR)
+    await _congest(first, capacity)
+    await _enqueue(capacity, [("owner", 0, first), ("later", 1, second)])
+    clock.ms = 1_000
+    assert await second.poll(capacity, "later", ready_in_ms=5_000) == Waiting()
+
+    refreshed: Final = await first.poll(capacity, "owner", ready_in_ms=2_000)
+    clock.ms = 3_000
+    owner_turn: Final = await first.poll(capacity, "owner")
+
+    assert refreshed == Waiting()
+    assert isinstance(owner_turn, Probe) and owner_turn.generation == 1
+
+
+@pytest.mark.asyncio
+async def test_a_recovery_snapshot_admits_its_first_ready_member_across_workers(
+    capacity: str, workers: WorkerFactory
+) -> None:
+    clock: Final = SharedClock()
+    first, second = workers.pair(clock, required_successes=1, liveness_ms=FAR)
+    await _congest(first, capacity)
+    await _enqueue(capacity, [("prober", -5, first), ("cooling", 1, first), ("ready", 2, second)])
+    clock.ms = 1_000
+    probe: Final = await first.poll(capacity, "prober")
+    assert isinstance(probe, Probe)
+    assert await first.report(capacity, "prober", probe, Succeeded()) is None
+
+    cooling_early: Final = await first.poll(capacity, "cooling", ready_in_ms=2_000)
+    ready: Final = await second.poll(capacity, "ready")
+    clock.ms = 3_000
+    cooling_late: Final = await first.poll(capacity, "cooling")
+
+    assert cooling_early == Waiting(ahead=0)
+    assert isinstance(ready, Released)
+    assert isinstance(cooling_late, Released)
+
+
+COOLING_AHEAD: Final = 70
+
+
+@pytest.mark.asyncio
+async def test_a_ready_waiter_behind_more_cooling_waiters_than_one_sweep_still_gets_the_probe(
+    capacity: str, workers: WorkerFactory
+) -> None:
+    clock: Final = SharedClock()
+    first, second = workers.pair(clock, liveness_ms=FAR)
+    await _congest(first, capacity)
+    clock.ms = 1_000
+    for index in range(COOLING_AHEAD):
+        reply = await first.admit(WaitRequest(capacity, f"cooling-{index}", 0), FAR, ready_in_ms=FAR)
+        assert reply == Waiting(), (index, reply)
+
+    ready: Final = await second.admit(WaitRequest(capacity, "ready", 9), FAR)
+
+    assert isinstance(ready, Probe)
+
+
+@pytest.mark.asyncio
+async def test_a_queue_at_the_largest_supported_size_still_probes_its_last_ready_waiter_and_refuses_one_more(
+    capacity: str, workers: WorkerFactory
+) -> None:
+    clock: Final = SharedClock()
+    first, second = workers.pair(clock, max_waiting=MAX_WAITING_LIMIT, liveness_ms=FAR)
+    await _congest(first, capacity)
+    for index in range(MAX_WAITING_LIMIT - 1):
+        reply = await first.admit(WaitRequest(capacity, f"cooling-{index}", 0), FAR, ready_in_ms=FAR)
+        assert reply == Waiting(probe_in_ms=1_000), (index, reply)
+    assert await second.admit(WaitRequest(capacity, "ready", 9), FAR) == Waiting(probe_in_ms=1_000)
+
+    one_more: Final = await first.admit(WaitRequest(capacity, "one-more", 0), FAR)
+    clock.ms = 1_000
+    ready: Final = await second.poll(capacity, "ready")
+
+    assert isinstance(one_more, QueueFull)
+    assert isinstance(ready, Probe)
+
+
+@pytest.mark.asyncio
+async def test_a_ready_snapshot_member_behind_more_cooling_members_than_one_sweep_still_claims(
+    capacity: str, workers: WorkerFactory
+) -> None:
+    clock: Final = SharedClock()
+    first, second = workers.pair(clock, required_successes=1, liveness_ms=FAR)
+    await _congest(first, capacity)
+    await _enqueue(capacity, [("prober", -1, first)])
+    for index in range(COOLING_AHEAD):
+        reply = await first.admit(WaitRequest(capacity, f"cooling-{index}", 0), FAR, ready_in_ms=FAR)
+        assert reply == Waiting(probe_in_ms=1_000), (index, reply)
+    await _enqueue(capacity, [("ready", 9, second)])
+    clock.ms = 1_000
+    probe: Final = await first.poll(capacity, "prober")
+    assert isinstance(probe, Probe)
+    assert await first.report(capacity, "prober", probe, Succeeded()) is None
+
+    claimed: Final = await second.poll(capacity, "ready")
+
+    assert isinstance(claimed, Released)
+
+
+async def _probe_hints(
+    backend: RedisQueueBackend | LocalQueueBackend, capacity: str, clock: SharedClock
+) -> tuple[tuple[type[object], int | None], ...]:
+    clock.ms = 0
+    assert await backend.report(capacity, "in-flight", PassThrough(0), MatchingFailure(20_000)) is None
+    first: Final = await backend.admit(WaitRequest(capacity, "a", 0), FAR)
+    clock.ms = 5_000
+    later: Final = await backend.poll(capacity, "a")
+    clock.ms = 20_000
+    probe: Final = await backend.poll(capacity, "a")
+    behind_the_probe: Final = await backend.admit(WaitRequest(capacity, "b", 0), FAR)
+    return tuple(
+        (type(reply), reply.probe_in_ms if isinstance(reply, Waiting) else None)
+        for reply in (first, later, probe, behind_the_probe)
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_wait_reply_hints_the_next_probe_only_while_no_probe_is_out_as_the_in_process_queue_does(
+    capacity: str, workers: WorkerFactory
+) -> None:
+    clock: Final = SharedClock()
+    in_redis: Final = await _probe_hints(workers(clock, liveness_ms=FAR), capacity, clock)
+    in_process: Final = await _probe_hints(
+        LocalQueueBackend(QueueSettings(liveness_ms=FAR), clock=lambda: clock.ms / 1000), capacity, clock
+    )
+
+    assert in_redis == in_process
+    assert in_process == ((Waiting, 20_000), (Waiting, 15_000), (Probe, None), (Waiting, None))
+
+
+SHORT_LIVENESS: Final = MappingProxyType({"liveness_ms": 900, "operation_timeout_ms": 200})
+
+
+async def _driven(
+    timer: ManualTimer,
+    clock: SharedClock,
+    waiting: "asyncio.Task[Admitted | Rejection]",
+    until_s: float,
+    tick_s: float = 0.25,
+) -> None:
+    """Moves the waiter's timer and Redis time together, ``tick_s`` at a time whenever the waiter is parked on a
+    recheck, until it settles or ``until_s``."""
+    for _ in range(10_000):
+        await timer.parked(waiting)
+        if waiting.done() or timer.at >= until_s:
+            return
+        timer.advance(tick_s)
+        clock.ms = round(timer.at * 1000)
+    raise AssertionError("deadlock safeguard: the wait never settled")
+
+
+class Lagging:
+    """Delays an admit's reply, a readiness read and a poll's request by ``lag_s``, on the waiter's timer and Redis
+    time alike, each within the operation timeout."""
+
+    def __init__(self, inner: RedisQueueBackend, timer: ManualTimer, clock: SharedClock, lag_s: float) -> None:
+        self._inner = inner
+        self._timer = timer
+        self._clock = clock
+        self._lag_s = lag_s
+
+    @property
+    def settings(self) -> QueueSettings:
+        return self._inner.settings
+
+    def _lag(self) -> None:
+        self._timer.at += self._lag_s
+        self._clock.ms = round(self._timer.at * 1000)
+
+    async def readiness(self) -> float:
+        self._lag()
+        return 0.0
+
+    async def admit(self, request: WaitRequest, budget_ms: int, ready_in_ms: int = 0) -> AdmitReply:
+        reply: Final = await self._inner.admit(request, budget_ms, ready_in_ms)
+        self._lag()
+        return reply
+
+    async def poll(self, capacity: str, waiter_id: str, ready_in_ms: int = 0) -> PollReply:
+        self._lag()
+        return await self._inner.poll(capacity, waiter_id, ready_in_ms)
+
+    async def renew(self, capacity: str, waiter_id: str, token: int) -> bool | CoordinationUnavailable:
+        return await self._inner.renew(capacity, waiter_id, token)
+
+    async def report(
+        self, capacity: str, waiter_id: str, grant: Grant, outcome: Outcome
+    ) -> None | CoordinationUnavailable:
+        return await self._inner.report(capacity, waiter_id, grant, outcome)
+
+    async def abandon(self, capacity: str, waiter_id: str) -> None | CoordinationUnavailable:
+        return await self._inner.abandon(capacity, waiter_id)
+
+
+@pytest.mark.parametrize(
+    ("liveness", "lag_s", "tick_s", "latest_s"),
+    [
+        (SHORT_LIVENESS, 0.0, 0.25, 5.0),
+        (MappingProxyType({"liveness_ms": 1_200, "operation_timeout_ms": 200}), 0.19, 0.01, 5.7),
+    ],
+    ids=["prompt_replies", "replies_lagging_just_under_the_operation_timeout"],
+)
+@pytest.mark.asyncio
+async def test_a_wait_behind_a_long_probe_backoff_outlives_a_short_liveness_until_its_probe(
+    capacity: str,
+    workers: WorkerFactory,
+    liveness: Mapping[str, int],
+    lag_s: float,
+    tick_s: float,
+    latest_s: float,
+) -> None:
+    timer: Final = ManualTimer()
+    clock: Final = SharedClock()
+    inner: Final = workers(clock, **liveness)
+    await _congest(inner, capacity, retry_after_ms=5_000)
+    worker: Final = Lagging(inner, timer, clock, lag_s)
+    queue: Final = DynamicQueue(worker, timer)
+    waiting: Final = asyncio.create_task(queue.admit(WaitRequest(capacity, "a", 0), 30.0, worker.readiness))
+    try:
+        await _driven(timer, clock, waiting, until_s=FAR, tick_s=tick_s)
+        outcome: Final = waiting.result()
+    finally:
+        await _reap(waiting)
+
+    assert isinstance(outcome, Admitted) and isinstance(outcome.grant, Probe)
+    assert 5.0 <= timer.at <= latest_s
+
+
+@pytest.mark.asyncio
+async def test_cancelling_a_wait_during_a_long_probe_backoff_gives_its_place_back_on_every_worker(
+    capacity: str, workers: WorkerFactory
+) -> None:
+    timer: Final = ManualTimer()
+    clock: Final = SharedClock()
+    waiter_worker, other_worker = workers.pair(clock, max_waiting=1, **SHORT_LIVENESS)
+    await _congest(waiter_worker, capacity, retry_after_ms=5_000)
+    waiting: Final = asyncio.create_task(DynamicQueue(waiter_worker, timer).admit(WaitRequest(capacity, "a", 0), 30.0))
+    try:
+        await _driven(timer, clock, waiting, until_s=2.0)
+        held: Final = await other_worker.admit(WaitRequest(capacity, "b", 0), FAR)
+        _ = waiting.cancel()
+        cancelled: Final = (await asyncio.gather(waiting, return_exceptions=True))[0]
+    finally:
+        await _reap(waiting)
+    freed: Final = await other_worker.admit(WaitRequest(capacity, "b", 0), FAR)
+
+    assert isinstance(held, QueueFull)
+    assert isinstance(cancelled, asyncio.CancelledError)
+    assert freed == Waiting(probe_in_ms=3_000)

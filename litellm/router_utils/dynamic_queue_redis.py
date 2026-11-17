@@ -59,12 +59,25 @@ local function waiter_of(member)
   return string.sub(member, string.find(member, '|', 1, true) + 22)
 end
 
-local function member_of(w)
+local function entry_of(w)
   local entry = redis.call('HGET', members, w)
   if not entry then
     return nil
   end
-  return string.sub(entry, string.find(entry, '|', 1, true) + 1)
+  local first = string.find(entry, '|', 1, true)
+  local second = string.find(entry, '|', first + 1, true)
+  return tonumber(string.sub(entry, 1, first - 1)), tonumber(string.sub(entry, first + 1, second - 1)),
+    string.sub(entry, second + 1)
+end
+
+local function member_of(w)
+  local _, _, member = entry_of(w)
+  return member
+end
+
+local function ready_of(w)
+  local _, ready = entry_of(w)
+  return ready or 0
 end
 
 local function expired(w)
@@ -120,17 +133,14 @@ local function sweep()
   end
 end
 
-local function head_of(set)
-  for _ = 0, sweep_limit do
-    local head = redis.call('ZRANGE', set, 0, 0)[1]
-    if not head then
-      return nil
+local function first_ready(set)
+  for _, member in ipairs(redis.call('ZRANGE', set, 0, max_waiting - 1)) do
+    local w = waiter_of(member)
+    if expired(w) then
+      drop(w)
+    elseif ready_of(w) <= now then
+      return member, w
     end
-    local w = waiter_of(head)
-    if not expired(w) then
-      return head, w
-    end
-    drop(w)
   end
   return nil
 end
@@ -139,7 +149,7 @@ local function grant_probe()
   if not congested() or redis.call('HEXISTS', state, 'lease_waiter') == 1 or now < num('next_probe') then
     return
   end
-  local head, w = head_of(queue)
+  local head, w = first_ready(queue)
   if not head then
     return
   end
@@ -198,7 +208,14 @@ local function settle_congested(w)
   grant_probe()
   local claimed = claim_probe(w)
   touch()
-  return claimed or {'wait'}
+  if claimed then
+    return claimed
+  end
+  local probe_in = num('next_probe') - now
+  if probe_in > 0 and redis.call('HEXISTS', state, 'lease_waiter') == 0 then
+    return {'wait', 'probe', probe_in}
+  end
+  return {'wait'}
 end
 
 local function admitted(w, member)
@@ -229,7 +246,7 @@ if op == 'admit' then
   local member = ARGV[12] .. '|' .. string.format('%020d', seq) .. '|' .. waiter
   local deadline = now + budget
   redis.call('ZADD', queue, 0, member)
-  redis.call('HSET', members, waiter, deadline .. '|' .. member)
+  redis.call('HSET', members, waiter, deadline .. '|' .. (now + tonumber(ARGV[14])) .. '|' .. member)
   redis.call('ZADD', expiry, math.min(deadline, now + liveness_ms), waiter)
   if congested() then
     return settle_congested(waiter)
@@ -245,20 +262,27 @@ if op == 'poll' then
     touch()
     return {'gone'}
   end
+  local deadline, _, member = entry_of(waiter)
+  if member then
+    local ready = now + tonumber(ARGV[12])
+    redis.call('HSET', members, waiter, deadline .. '|' .. ready .. '|' .. member)
+    if ready > now and redis.call('HGET', state, 'lease_waiter') == waiter
+      and redis.call('HGET', state, 'lease_claimed') == '0' then
+      clear_lease()
+      redis.call('ZADD', queue, 0, member)
+    end
+  end
   local claimed = claim_probe(waiter)
   if claimed then
     touch()
     return claimed
   end
-  local entry = redis.call('HGET', members, waiter)
-  if not entry then
+  if not member then
     return {'gone'}
   end
-  local split = string.find(entry, '|', 1, true)
-  local member = string.sub(entry, split + 1)
-  redis.call('ZADD', expiry, math.min(tonumber(string.sub(entry, 1, split - 1)), now + liveness_ms), waiter)
+  redis.call('ZADD', expiry, math.min(deadline, now + liveness_ms), waiter)
   if redis.call('ZSCORE', drain, member) then
-    local _, head_waiter = head_of(drain)
+    local _, head_waiter = first_ready(drain)
     if head_waiter == waiter then
       admitted(waiter, member)
       return {'grant', 'released|' .. num('generation')}
@@ -360,6 +384,8 @@ def _settled(reply: tuple[str, ...]) -> Grant | Waiting | QueueFull | Gone | Coo
             return Waiting()
         case ("wait", ahead):
             return Waiting(ahead=int(ahead))
+        case ("wait", "probe", probe_in_ms):
+            return Waiting(probe_in_ms=int(probe_in_ms))
         case ("full",):
             return QueueFull()
         case ("gone",):
@@ -442,14 +468,14 @@ class RedisQueueBackend:
         except ValidationError:
             return _unexpected((type(raw).__name__,))
 
-    async def admit(self, request: WaitRequest, budget_ms: int) -> AdmitReply:
+    async def admit(self, request: WaitRequest, budget_ms: int, ready_in_ms: int = 0) -> AdmitReply:
         reply: Final = await self._call(
-            "admit", request.capacity, request.waiter_id, (rank_key(request.priority), budget_ms)
+            "admit", request.capacity, request.waiter_id, (rank_key(request.priority), budget_ms, ready_in_ms)
         )
         return reply if isinstance(reply, CoordinationUnavailable) else _settled(reply)
 
-    async def poll(self, capacity: str, waiter_id: str) -> PollReply:
-        reply: Final = await self._call("poll", capacity, waiter_id, ())
+    async def poll(self, capacity: str, waiter_id: str, ready_in_ms: int = 0) -> PollReply:
+        reply: Final = await self._call("poll", capacity, waiter_id, (ready_in_ms,))
         if isinstance(reply, CoordinationUnavailable):
             return reply
         settled: Final = _settled(reply)
