@@ -1030,7 +1030,7 @@ from litellm.proxy.spend_tracking.committed_spend import (
     is_committed_spend_key,
     seed_committed_spend,
 )
-from litellm.proxy.spend_tracking.rust_spend_counters import charge_spend_counters, runs_on_rust_store
+from litellm.proxy.spend_tracking.rust_spend_counters import charge_spend_counters
 from litellm.proxy.spend_tracking.spend_capture_rate import (
     run_scheduled_spend_capture_rate_check,
 )
@@ -3798,10 +3798,9 @@ async def increment_spend_counters(
     updated before the next request's auth check runs.
 
     With the ledger the whole step runs in Rust, the customer hierarchy in
-    ``customer_hierarchy`` settled first. A store the Rust step cannot run on
-    takes the Python path below, the hierarchy settled ahead of it.
+    ``customer_hierarchy`` settled first.
     """
-    if windows_from_ledger and runs_on_rust_store():
+    if windows_from_ledger:
         await charge_spend_counters(
             token=token,
             team_id=team_id,
@@ -3818,12 +3817,6 @@ async def increment_spend_counters(
             customer_hierarchy=customer_hierarchy,
         )
         return
-    if customer_hierarchy is not None and response_cost:
-        from litellm.proxy.auth.customer_spend import settle_customer_spend
-
-        await settle_customer_spend(
-            {"user_api_key_customer_hierarchy": customer_hierarchy}, response_cost, spend_counter_store
-        )
     with spend_counter_batch_scope(
         spend_counter_store,
         counter_keys=post_call_counter_keys(

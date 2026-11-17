@@ -183,13 +183,6 @@ def _customer_scopes(customer_hierarchy: object) -> tuple[Mapping[str, object], 
     return tuple({"counter_key": customer_spend_counter(scope), "spend": scope.spend} for scope in hierarchy.scopes)
 
 
-def runs_on_rust_store() -> bool:
-    """Whether the proxy's installed spend counter store is the Rust one the counter step runs on."""
-    from litellm.proxy.spend_tracking.native_budgets import native_budgets
-
-    return native_budgets() is not None
-
-
 async def charge_spend_counters(
     token: str | None,
     team_id: str | None,
