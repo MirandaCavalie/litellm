@@ -111,14 +111,21 @@ def _masked(rows: Sequence[Mapping[str, JsonValue]], volatile: Sequence[str]) ->
     return [{key: value for key, value in row.items() if key not in volatile} for row in rows]
 
 
+def _counters(keys: Sequence[str]) -> Sequence[float]:
+    return [ps.spend_counter_store.get_local(key) or 0.0 for key in keys]
+
+
 @pytest.mark.asyncio
 async def test_a_completion_lands_the_same_spend_log_and_delivery_rows(ledger: Ledger) -> None:
+    token: Final = f"hashed-{uuid.uuid4().hex}"
+    team: Final = f"team-{uuid.uuid4().hex}"
+    counters: Final = (f"spend:key:{token}", f"spend:team:{team}", f"spend:team_member:user-1:{team}")
     done: Final = await completion(
         {
-            "user_api_key": f"hashed-{uuid.uuid4().hex}",
+            "user_api_key": token,
             "user_api_key_alias": "alias",
             "user_api_key_user_id": "user-1",
-            "user_api_key_team_id": "team-1",
+            "user_api_key_team_id": team,
             "user_api_key_org_id": "org-1",
             "tags": ["blue"],
         }
@@ -128,9 +135,11 @@ async def test_a_completion_lands_the_same_spend_log_and_delivery_rows(ledger: L
     await legacy_success(done)
     await ledger.flush_python()
     python_logs, python_deliveries = await ledger.stored([request_id])
+    after_python: Final = _counters(counters)
     await rust_success(ledger.logger, done)
     await ledger.logger.flush_native()
     rust_logs, rust_deliveries = await ledger.stored([request_id])
+    after_rust: Final = _counters(counters)
 
     assert len(ledger.writer) == 0
     assert [len(rust_logs), len(rust_deliveries)] == [1, 1]
@@ -138,6 +147,10 @@ async def test_a_completion_lands_the_same_spend_log_and_delivery_rows(ledger: L
     assert rust_deliveries[0]["request_id"] == request_id
     assert _masked(rust_logs, _LOG_VOLATILE) == _masked(python_logs, _LOG_VOLATILE)
     assert _masked(rust_deliveries, _DELIVERY_VOLATILE) == _masked(python_deliveries, _DELIVERY_VOLATILE)
+    cost: Final = rust_logs[0]["spend"]
+    assert isinstance(cost, float) and cost > 0
+    assert after_python == [cost] * len(counters)
+    assert after_rust == [2 * cost] * len(counters)
 
 
 @pytest.mark.asyncio

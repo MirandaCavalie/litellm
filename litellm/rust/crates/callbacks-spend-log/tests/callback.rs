@@ -147,6 +147,14 @@ fn input(hook: Hook, spend_log_input: Json, reservation: Option<BudgetReservatio
 }
 
 /// Runs one hook with a host that answers every call and records them.
+/// One `null` per batch item, the proxy's answer when nothing is cached or stored.
+fn nulls(request: &Json, items: &str) -> Json {
+    Json::Array(vec![
+        Json::Null;
+        request[items].as_array().map_or(0, Vec::len)
+    ])
+}
+
 async fn run(harness: &Harness, input: HookInput) -> Vec<(String, Json)> {
     let callback = Arc::clone(&harness.callback);
     let mut body = hosted(|host| async move {
@@ -169,6 +177,14 @@ async fn run(harness: &Harness, input: HookInput) -> Vec<(String, Json)> {
                     }),
                     "enrich_key_identity" => {
                         json!({"user_id": "enriched-user", "team_alias": "enriched-team"})
+                    }
+                    "budget_windows" => nulls(&request, "entities"),
+                    "stored_spend" => nulls(&request, "counters"),
+                    "cached_spend" => {
+                        Json::Array(vec![
+                            json!(0.0);
+                            request["sources"].as_array().map_or(0, Vec::len)
+                        ])
                     }
                     _ => Json::Null,
                 };
@@ -237,11 +253,21 @@ async fn a_priced_success_queues_one_ledger_row_and_calls_the_host_in_order(gold
         names(&calls),
         [
             "accounting_context",
+            "budget_windows",
+            "stored_spend",
+            "cached_spend",
+            "budget_windows",
             "soft_budget_alert",
             "increment_proxy_spend",
             "customer_spend_alert"
         ]
     );
+    let user = harness
+        .counters
+        .get_local(&SpendCounter::parse("spend:user:user-1").unwrap())
+        .unwrap()
+        .map(Number::as_f64);
+    assert_eq!(user, Some(0.25));
     let rows = queued(&harness);
     assert_eq!(rows.len(), 1);
     assert_eq!(get(&rows[0], "spend"), Some(&Value::Float(0.25)));
