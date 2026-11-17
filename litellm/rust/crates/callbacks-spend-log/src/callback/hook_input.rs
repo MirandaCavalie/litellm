@@ -1,8 +1,9 @@
 //! The `spend_log_input` field, typed. The Python derivation
 //! (`litellm/proxy/spend_tracking/rust_spend_log_inputs.py`) reads what only Python holds (the
 //! response object, the auth object, the router, the settings) and hands over one document per
-//! hook: the proxy flags the writer reads, the identity the request is charged to, and each
-//! row's builder input and cost.
+//! hook: the proxy flags the writer reads, the identity the request is charged to, the raw facts
+//! about the response and the logging payload, and each row's builder input and cost. Every
+//! decision over those facts is made in Rust ([`super::policy`]).
 
 use litellm_callbacks_budgets::CustomerScopeSpend;
 use serde::Deserialize;
@@ -20,6 +21,10 @@ pub struct Settings {
     pub row_config: Value,
     /// `litellm_proxy_budget_name` when a proxy `max_budget` is set.
     pub proxy_budget_name: Option<String>,
+    /// `litellm.apply_search_free_tier`.
+    pub apply_search_free_tier: bool,
+    /// `BACKGROUND_INTERACTION_COST_POLLING_ENABLED`.
+    pub background_interaction_cost_polling: bool,
 }
 
 /// Who a request is charged to, from the proxy-stamped `user_api_key_*` metadata (success) or
@@ -58,30 +63,26 @@ pub struct RowRequest {
     pub customer_hierarchy: Vec<CustomerScopeSpend>,
 }
 
-/// How the success callback treats a request before any charge.
+/// What only the response object can tell: a batch whose cost is not final yet
+/// (`defers_batch_cost`), and an interaction create with no usage
+/// (`_is_unbilled_interaction_response`) that may still be running in the background.
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum Disposition {
-    /// The cost is known: gate, then charge.
-    #[default]
-    Charge,
-    /// `defers_batch_cost`: a batch whose cost is not final yet.
-    DeferBatch,
-    /// An in-progress background interaction the poll task settles later.
-    InteractionInProgress,
-    /// An interaction create with no usage that no poll task settles.
-    InteractionUnbilled,
-    /// No cost and nothing to defer: an error, since a priced call lost its cost.
-    Unpriced,
-    /// No cost and nothing to charge: a call with no logging payload, or a stream still running.
-    Released,
+#[serde(default)]
+pub struct ResponseFacts {
+    pub defers_batch_cost: bool,
+    pub unbilled_interaction: bool,
+    pub interaction_in_progress: bool,
 }
 
-/// Key identity enrichment from the key and team cache when the key carries no user.
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+/// The logging payload facts the row builder input leaves out.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
-pub struct Enrich {
-    pub resolve_missing_key_identity: bool,
+pub struct PayloadFacts {
+    /// `cost_finalized`: the cost was settled before the callback, allowance included.
+    pub cost_finalized: bool,
+    pub cache_hit: bool,
+    /// `str(response_cost_failure_debug_info)` when it is set.
+    pub cost_failure_debug_info: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
@@ -89,15 +90,16 @@ pub struct Enrich {
 pub struct Success {
     pub settings: Settings,
     pub identity: Identity,
-    pub enrich: Option<Enrich>,
-    pub disposition: Disposition,
     pub call_type: Option<String>,
-    /// `call_type` is one the proxy tracks with no identity (pass-through, MCP, a batch's cost).
-    pub tracks_unattributed: bool,
-    pub tags: Option<Vec<String>>,
+    pub response: ResponseFacts,
+    pub payload: PayloadFacts,
+    /// `kwargs["stream"] is True`.
+    pub stream: bool,
+    /// The kwargs carry `complete_streaming_response`.
+    pub stream_complete: bool,
     pub end_user_max_budget: Option<f64>,
-    /// `repeat_poll_cost`: what a poll of a job an earlier poll charged still pays for.
-    pub repeat_poll_cost: f64,
+    /// A CheckBatchCost costing waits on this request's `BatchAccountingOutcome`.
+    pub batch_accounting: bool,
     /// The `window_reset_at` of each reservation entry, which the typed reservation lacks.
     pub window_resets: Vec<Option<String>>,
     pub row: RowRequest,
@@ -108,12 +110,12 @@ pub struct Success {
 pub struct Failure {
     pub settings: Settings,
     pub identity: Identity,
-    pub enrich: Option<Enrich>,
+    /// The failure is no `DBLookupDeadlineExceeded`, so the key identity may be looked up.
+    pub enrich: bool,
     /// The standard logging payload says `cost_finalized`.
     pub completed_cost: bool,
     /// The failure is one the proxy writes rows for (error logs on, a trackable route).
     pub track: bool,
-    pub tags: Option<Vec<String>>,
     pub window_resets: Vec<Option<String>>,
     pub rows: Vec<RowRequest>,
 }

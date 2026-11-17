@@ -9,16 +9,21 @@ from litellm._internal_context import service_target
 from litellm._logging import verbose_proxy_logger
 from litellm.constants import MINIMUM_CUSTOM_KEY_LENGTH
 from litellm.integrations.custom_logger_v2.call import CallContext
-from litellm.integrations.custom_logger_v2.enums import Activation, Field, Hook
-from litellm.integrations.custom_logger_v2.logger import CustomLoggerV2, on
+from litellm.integrations.custom_logger_v2.enums import Field, Hook
 from litellm.integrations.custom_logger_v2.outcomes import Abort, Patch
 from litellm.integrations.custom_logger_v2.rust import RustLogger, rust_logger
-from litellm.integrations.custom_logger_v2.selection import Selection
 from litellm.litellm_core_utils.safe_json_dumps import safe_json_structure
 from litellm.proxy.auth.auth_object_prefetch import AUTH_OBJECTS_TARGET
-from litellm.proxy.db.db_spend_update_writer import debitable_model_access_groups, get_llm_router
+from litellm.proxy.db.db_spend_update_writer import (
+    _turn_chains_through_the_db,  # pyright: ignore[reportPrivateUsage]  # the writer's own Responses chaining check
+    debitable_model_access_groups,
+    get_llm_router,
+)
 from litellm.proxy.db.rust_spend_log_writer import rust_spend_log_writer
-from litellm.proxy.hooks.proxy_track_cost_callback import ProxyDBLogger
+from litellm.proxy.hooks.proxy_track_cost_callback import (
+    ProxyDBLogger,
+    _batch_accounting_for,  # pyright: ignore[reportPrivateUsage]  # the cost callback's batch costing outcome
+)
 from litellm.proxy.spend_tracking.rust_spend_counters import (
     _CounterHost,  # pyright: ignore[reportPrivateUsage]  # the counter step's host, which the callback's host extends
 )
@@ -89,11 +94,7 @@ async def _committed_tracked(request: Mapping[str, object]) -> Sequence[str]:
     from litellm.proxy.spend_tracking.committed_spend import committed_spend_tracked, warm_committed_counter_keys
     from litellm.types.proxy.carried_budget_state import EntitySpendCounterKeys
 
-    carried: Final = request.get("committed")
-    if isinstance(carried, list):
-        return _texts(carried)  # pyright: ignore[reportUnknownArgumentType]  # a JSON array from the host request
-    cost: Final = request.get("response_cost")
-    if not isinstance(cost, int | float) or cost <= 0 or not committed_spend_tracked():
+    if request.get("warm_committed") is not True or not committed_spend_tracked():
         return []
     warmed: Final = await warm_committed_counter_keys(
         spend_counter_store,
@@ -163,6 +164,8 @@ class SpendLogHost(_CounterHost):
                 for counter in customer_counters
             ],
             "committed_tracked": await _committed_tracked(request),
+            "chains_through_db": request.get("responses_turn") is True
+            and _turn_chains_through_the_db(row, get_llm_router()),  # pyright: ignore[reportArgumentType]  # the decoded spend log row
         }
 
     def increment_proxy_spend(self, request: Mapping[str, object]) -> None:
@@ -172,6 +175,50 @@ class SpendLogHost(_CounterHost):
         token: Final = _text(request.get("token"))
         if token is not None:
             _spawn(_soft_budget_alert(token, _cost(request.get("response_cost"))), "soft budget alert")
+
+    def cached_spend_bump(self, request: Mapping[str, object]) -> None:
+        from litellm.proxy.proxy_server import add_spend_to_cached_spend_objects, user_api_key_cache
+
+        add_spend_to_cached_spend_objects(
+            user_api_key_cache,
+            _text(request.get("user_id")),
+            _text(request.get("end_user_id")),
+            _text(request.get("team_id")),
+            None if (tags := request.get("tags")) is None else _texts(tags),
+            _cost(request.get("response_cost")),
+        )
+
+    def failed_tracking_alert(self, request: Mapping[str, object]) -> None:
+        from litellm.proxy.proxy_server import proxy_logging_obj
+
+        _spawn(
+            proxy_logging_obj.failed_tracking_alert(
+                error_message=_text(request.get("error_message")) or "",
+                failing_model=_text(request.get("failing_model")) or "",
+            ),
+            "failed tracking alert",
+        )
+
+    def batch_accounting(self, request: Mapping[str, object]) -> None:
+        outcome: Final = _batch_accounting_for(request.get("call_id"))
+        if outcome is None:
+            return
+        outcome.write_started = outcome.write_started or request.get("write_started") is True
+        outcome.failed = outcome.failed or request.get("failed") is True
+
+    async def increment_search_free_tier(self, request: Mapping[str, object]) -> float | None:
+        from litellm.proxy.proxy_server import proxy_logging_obj
+
+        counter: Final = proxy_logging_obj.internal_usage_cache.dual_cache.redis_cache
+        key: Final = _text(request.get("key"))
+        units: Final = request.get("units")
+        ttl: Final = request.get("ttl")
+        if counter is None or key is None:
+            return None
+        if not isinstance(units, int) or not isinstance(ttl, int):
+            return None
+        with service_target("search_free_tier"):
+            return await counter.async_increment(key, units, ttl=ttl)  # pyright: ignore[reportUnknownMemberType]  # RedisCache leaves its key parameter untyped
 
     def customer_spend_alert(self, request: Mapping[str, object]) -> None:
         from litellm.proxy.proxy_server import proxy_logging_obj
@@ -221,47 +268,7 @@ def spend_logger(writer: RustSpendLogWriter, spend_counters: NativeSpendCounters
     return rust_logger(rust, host=SpendLogHost(), base=_AsyncLineRustLogger)
 
 
-class CachedSpendBumps(CustomLoggerV2):
-    selection = Selection(name="cached_spend_bumps", activation=Activation.required)
-
-    @on(Hook.attempt_ended, reads=frozenset({Field.spend_log_input, Field.outcome}), awaited=True)
-    async def on_attempt_ended(self, view: object, ctx: CallContext[object]) -> None:
-        from litellm.proxy.hooks.proxy_track_cost_callback import (
-            _should_track_cost_callback,  # pyright: ignore[reportPrivateUsage]  # the cost callback's own gate
-        )
-        from litellm.proxy.proxy_server import add_spend_to_cached_spend_objects, user_api_key_cache
-        from litellm.types.integrations.custom_logger_v2 import Outcome
-
-        if not _on_async_line(Hook.attempt_ended):
-            return
-        if getattr(view, Field.outcome.value, None) in (Outcome.failure, Outcome.fallback_failure):
-            return
-        document: Final = _mapping(getattr(view, Field.spend_log_input.value, None))
-        if document.get("kind") != "success" or document.get("disposition") != "charge":
-            return
-        cost: Final = _mapping(document.get("row")).get("response_cost")
-        identity: Final = _mapping(document.get("identity"))
-        if not isinstance(cost, int | float) or not _should_track_cost_callback(
-            user_api_key=_text(identity.get("token")),
-            user_id=_text(identity.get("user_id")),
-            team_id=_text(identity.get("team_id")),
-            end_user_id=_text(identity.get("end_user_id")),
-            call_type=_text(document.get("call_type")),
-            agent_id=_text(identity.get("agent_id")),
-        ):
-            return
-        tags: Final = document.get("tags")
-        add_spend_to_cached_spend_objects(
-            user_api_key_cache,
-            _text(identity.get("user_id")),
-            _text(identity.get("end_user_id")),
-            _text(identity.get("team_id")),
-            _texts(tags),
-            float(cost),
-        )
-
-
-def rust_spend_loggers(prisma_client: object) -> tuple[RustLogger, CachedSpendBumps] | None:
+def rust_spend_loggers(prisma_client: object) -> RustLogger | None:
     from litellm.proxy.proxy_server import spend_counter_store
 
     writer: Final = rust_spend_log_writer(prisma_client)
@@ -269,7 +276,7 @@ def rust_spend_loggers(prisma_client: object) -> tuple[RustLogger, CachedSpendBu
     if writer is None or not isinstance(handle, NativeSpendCounters):
         verbose_proxy_logger.debug("Spend tracking - no Rust spend log writer, keeping the Python cost callback")
         return None
-    return spend_logger(writer, handle), CachedSpendBumps()
+    return spend_logger(writer, handle)
 
 
-__all__ = ["CachedSpendBumps", "SpendLogHost", "rust_spend_loggers", "spend_logger"]
+__all__ = ["SpendLogHost", "rust_spend_loggers", "spend_logger"]

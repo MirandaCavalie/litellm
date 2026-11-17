@@ -3439,16 +3439,17 @@ spend_event_producer: SpendEventProducer | None = None
 
 
 def _register_rust_spend_loggers() -> bool:
-    if general_settings_view().get("use_spend_logs_ledger", True) is False:
+    from litellm.proxy.spend_tracking.rust_spend_log_rows import uses_spend_logs_ledger
+
+    if not uses_spend_logs_ledger():
         return False
     from litellm.proxy.hooks.rust_spend_logger import rust_spend_loggers
 
-    loggers: Final = rust_spend_loggers(prisma_client)
-    if loggers is None:
+    logger: Final = rust_spend_loggers(prisma_client)
+    if logger is None:
         return False
-    for logger in loggers:
-        litellm.logging_callback_manager.add_litellm_callback(logger)  # pyright: ignore[reportArgumentType]  # the callback list also holds V2 callbacks
-        litellm.logging_callback_manager.add_litellm_async_success_callback(logger)
+    litellm.logging_callback_manager.add_litellm_callback(logger)  # pyright: ignore[reportArgumentType]  # the callback list also holds V2 callbacks
+    litellm.logging_callback_manager.add_litellm_async_success_callback(logger)
     return True
 
 

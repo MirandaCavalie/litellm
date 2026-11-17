@@ -1,6 +1,7 @@
 use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use litellm_callbacks::{
@@ -52,6 +53,10 @@ struct Harness {
 }
 
 fn harness(store: Store) -> Harness {
+    harness_with(store, WriterSettings::default())
+}
+
+fn harness_with(store: Store, settings: WriterSettings) -> Harness {
     let counters = Arc::new(SpendCounters::new(None));
     counters
         .set_local(
@@ -63,7 +68,7 @@ fn harness(store: Store) -> Harness {
     let writer = Arc::new(SpendLogWriter::new(SpendLogFlusher::new(
         store.clone(),
         Arc::new(Quiet),
-        WriterSettings::default(),
+        settings,
     )));
     Harness {
         callback: Arc::new(SpendLogCallback::new(SpendLogParts {
@@ -174,7 +179,9 @@ async fn run(harness: &Harness, input: HookInput) -> Vec<(String, Json)> {
                         "windows": [],
                         "savings": {"compression": 0.0, "prompt_caching": 0.0},
                         "model_access_groups": [],
+                        "chains_through_db": request["responses_turn"],
                     }),
+                    "increment_search_free_tier" => json!(SEARCH_COUNTER_TOTAL_AFTER),
                     "enrich_key_identity" => {
                         json!({"user_id": "enriched-user", "team_alias": "enriched-team"})
                     }
@@ -195,12 +202,13 @@ async fn run(harness: &Harness, input: HookInput) -> Vec<(String, Json)> {
     }
 }
 
-fn success(config: &Json, row: Json, cost: Option<f64>, disposition: &str) -> Json {
+const SEARCH_COUNTER_TOTAL_AFTER: f64 = 6.0;
+
+fn success(config: &Json, row: Json, cost: Option<f64>) -> Json {
     json!({
         "kind": "success",
         "settings": settings(config),
         "identity": identity(),
-        "disposition": disposition,
         "call_type": "acompletion",
         "row": {"row": row, "response_cost": cost},
     })
@@ -241,11 +249,7 @@ async fn a_priced_success_queues_one_ledger_row_and_calls_the_host_in_order(gold
 
     let calls = run(
         &harness,
-        input(
-            Hook::AttemptEnded,
-            success(&config, row, Some(0.25), "charge"),
-            None,
-        ),
+        input(Hook::AttemptEnded, success(&config, row, Some(0.25)), None),
     )
     .await;
 
@@ -258,6 +262,7 @@ async fn a_priced_success_queues_one_ledger_row_and_calls_the_host_in_order(gold
             "cached_spend",
             "budget_windows",
             "soft_budget_alert",
+            "cached_spend_bump",
             "increment_proxy_spend",
             "customer_spend_alert"
         ]
@@ -284,7 +289,7 @@ async fn a_priced_success_queues_one_ledger_row_and_calls_the_host_in_order(gold
 async fn spend_logs_off_queue_only_the_charge(golden: (Json, Json)) {
     let (config, row) = golden;
     let harness = harness(Store::default());
-    let mut request = success(&config, row, Some(0.25), "charge");
+    let mut request = success(&config, row, Some(0.25));
     request["settings"]["disable_spend_logs"] = json!(true);
 
     run(&harness, input(Hook::AttemptEnded, request, None)).await;
@@ -302,7 +307,7 @@ async fn spend_logs_off_queue_only_the_charge(golden: (Json, Json)) {
 async fn disabled_spend_updates_skip_the_row_and_release_the_reservation(golden: (Json, Json)) {
     let (config, row) = golden;
     let harness = harness(Store::default());
-    let mut request = success(&config, row, Some(0.25), "charge");
+    let mut request = success(&config, row, Some(0.25));
     request["settings"]["disable_spend_updates"] = json!(true);
 
     let calls = run(
@@ -317,26 +322,26 @@ async fn disabled_spend_updates_skip_the_row_and_release_the_reservation(golden:
 }
 
 #[rstest]
-#[case::deferred_batch("defer_batch", Some(3.0))]
-#[case::unbilled_interaction("interaction_unbilled", Some(3.0))]
-#[case::interaction_still_running("interaction_in_progress", Some(5.0))]
-#[case::unpriced("unpriced", Some(3.0))]
+#[case::deferred_batch(Some(0.25), json!({"defers_batch_cost": true}), Some(3.0))]
+#[case::unbilled_interaction(None, json!({"unbilled_interaction": true}), Some(3.0))]
+#[case::interaction_still_running(None, json!({"unbilled_interaction": true, "interaction_in_progress": true}), Some(5.0))]
+#[case::unpriced(None, json!({}), Some(3.0))]
 #[tokio::test]
 async fn an_uncharged_success_releases_or_keeps_the_reservation(
     golden: (Json, Json),
-    #[case] disposition: &str,
+    #[case] cost: Option<f64>,
+    #[case] response: Json,
     #[case] counter_after: Option<f64>,
 ) {
     let (config, row) = golden;
     let harness = harness(Store::default());
+    let mut request = success(&config, row, cost);
+    request["response"] = response;
+    request["settings"]["background_interaction_cost_polling"] = json!(true);
 
     run(
         &harness,
-        input(
-            Hook::AttemptEnded,
-            success(&config, row, None, disposition),
-            Some(reservation()),
-        ),
+        input(Hook::AttemptEnded, request, Some(reservation())),
     )
     .await;
 
@@ -346,10 +351,171 @@ async fn an_uncharged_success_releases_or_keeps_the_reservation(
 
 #[rstest]
 #[tokio::test]
+async fn an_unpriced_success_raises_the_failed_tracking_alert_and_fails_the_batch(
+    golden: (Json, Json),
+) {
+    let (config, row) = golden;
+    let harness = harness(Store::default());
+    let mut request = success(&config, row.clone(), None);
+    request["payload"] = json!({"cost_failure_debug_info": "no price for the model"});
+    request["batch_accounting"] = json!(true);
+
+    let calls = run(
+        &harness,
+        input(Hook::AttemptEnded, request, Some(reservation())),
+    )
+    .await;
+
+    assert_eq!(names(&calls), ["failed_tracking_alert", "batch_accounting"]);
+    let alert = &calls[0].1;
+    let model = row["kwargs"]["model"].as_str().unwrap();
+    assert_eq!(alert["failing_model"], json!(model));
+    let message = alert["error_message"].as_str().unwrap();
+    assert!(
+        message.starts_with(&format!(
+            "Error in tracking cost callback - Cost tracking failed for model={model}.\nDebug info - no price for the model\n"
+        )),
+        "{message}"
+    );
+    assert!(message.ends_with("call_type: acompletion\n"), "{message}");
+    assert_eq!(
+        calls[1].1,
+        json!({"call_id": row["kwargs"]["litellm_call_id"], "write_started": true, "failed": true})
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn a_charged_success_without_a_reservation_starts_the_batch_write(golden: (Json, Json)) {
+    let (config, row) = golden;
+    let harness = harness(Store::default());
+    let mut request = success(&config, row.clone(), Some(0.25));
+    request["batch_accounting"] = json!(true);
+
+    let calls = run(&harness, input(Hook::AttemptEnded, request, None)).await;
+
+    let (_, outcome) = calls
+        .iter()
+        .find(|(name, _)| name == "batch_accounting")
+        .unwrap();
+    assert_eq!(
+        *outcome,
+        json!({"call_id": row["kwargs"]["litellm_call_id"], "write_started": true, "failed": false})
+    );
+}
+
+fn grounded(row: &Json, provider: &str) -> Json {
+    let mut row = row.clone();
+    row["usage"]["prompt_tokens_details"] = json!({"web_search_requests": 3});
+    row["standard_logging_object"]["custom_llm_provider"] = json!(provider);
+    row["standard_logging_object"]["cost_breakdown"] = json!({"input_cost": 0.5});
+    row["standard_logging_object"]["model_map_information"] = json!({"model_map_value": {
+        "litellm_provider": provider,
+        "web_search_billing_unit": "per_query",
+        "search_context_cost_per_query": {"search_context_size_medium": 0.1},
+        "search_free_requests": {"count": 5, "period": "day", "shared_group": "g3"},
+    }});
+    row
+}
+
+#[rstest]
+#[tokio::test]
+async fn grounding_under_the_free_allowance_is_not_charged(golden: (Json, Json)) {
+    let (config, row) = golden;
+    let harness = harness(Store::default());
+    let mut request = success(&config, grounded(&row, "gemini"), Some(1.0));
+    request["settings"]["apply_search_free_tier"] = json!(true);
+
+    let calls = run(&harness, input(Hook::AttemptEnded, request, None)).await;
+
+    let (_, counted) = calls
+        .iter()
+        .find(|(name, _)| name == "increment_search_free_tier")
+        .unwrap();
+    let day = counted["key"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("litellm:search_free_tier:gemini:g3:")
+        .unwrap();
+    assert!(
+        chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d").is_ok(),
+        "{day}"
+    );
+    assert_eq!(counted["units"], json!(3));
+    let units = 3.0;
+    let freed = (5.0 - (SEARCH_COUNTER_TOTAL_AFTER - units)).min(units);
+    let charged = 1.0 - 0.1 * units * freed / units;
+    let user = harness
+        .counters
+        .get_local(&SpendCounter::parse("spend:user:user-1").unwrap())
+        .unwrap()
+        .map(Number::as_f64)
+        .unwrap();
+    assert!((user - charged).abs() < 1e-12, "{user} != {charged}");
+    let rows = queued(&harness);
+    assert_eq!(get(&rows[0], "spend"), Some(&Value::Float(charged)));
+    let (_, bump) = calls
+        .iter()
+        .find(|(name, _)| name == "cached_spend_bump")
+        .unwrap();
+    assert_eq!(bump["response_cost"], json!(charged));
+}
+
+#[rstest]
+#[tokio::test]
+async fn a_finalized_cost_does_not_draw_from_the_allowance_again(golden: (Json, Json)) {
+    let (config, row) = golden;
+    let harness = harness(Store::default());
+    let mut request = success(&config, grounded(&row, "gemini"), Some(1.0));
+    request["settings"]["apply_search_free_tier"] = json!(true);
+    request["payload"] = json!({"cost_finalized": true});
+
+    let calls = run(&harness, input(Hook::AttemptEnded, request, None)).await;
+
+    assert!(!names(&calls).contains(&"increment_search_free_tier"));
+    assert_eq!(get(&queued(&harness)[0], "spend"), Some(&Value::Float(1.0)));
+}
+
+#[rstest]
+#[tokio::test]
+async fn a_responses_turn_wakes_the_writer_at_once(golden: (Json, Json)) {
+    let (config, mut row) = golden;
+    row["call_type"] = json!("aresponses");
+    let store = Store::default();
+    let harness = harness_with(
+        store.clone(),
+        WriterSettings {
+            poll_interval: Duration::from_secs(600),
+            max_backoff: Duration::from_secs(600),
+            ..WriterSettings::default()
+        },
+    );
+    let writer = Arc::clone(harness.callback.writer());
+    let monitor = tokio::spawn(async move { writer.run(|| None).await });
+    tokio::task::yield_now().await;
+
+    run(
+        &harness,
+        input(Hook::AttemptEnded, success(&config, row, Some(0.25)), None),
+    )
+    .await;
+
+    let written = tokio::time::timeout(Duration::from_secs(10), async {
+        while store.written.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    monitor.abort();
+    assert!(written.is_ok(), "the Responses turn waited for the poll");
+}
+
+#[rstest]
+#[tokio::test]
 async fn a_request_with_no_identity_is_not_charged(golden: (Json, Json)) {
     let (config, row) = golden;
     let harness = harness(Store::default());
-    let mut request = success(&config, row, Some(0.25), "charge");
+    let mut request = success(&config, row, Some(0.25));
     request["identity"] = json!({});
 
     let calls = run(&harness, input(Hook::AttemptEnded, request, None)).await;
@@ -363,11 +529,7 @@ async fn a_request_with_no_identity_is_not_charged(golden: (Json, Json)) {
 async fn a_failed_attempt_is_left_to_the_fallback(golden: (Json, Json)) {
     let (config, row) = golden;
     let harness = harness(Store::default());
-    let mut hook = input(
-        Hook::AttemptEnded,
-        success(&config, row, Some(0.25), "charge"),
-        None,
-    );
+    let mut hook = input(Hook::AttemptEnded, success(&config, row, Some(0.25)), None);
     hook.fields.insert(Field::Outcome, json!("failure"));
 
     run(&harness, hook).await;
@@ -381,9 +543,8 @@ async fn enrichment_fills_the_row_metadata_the_key_left_empty(golden: (Json, Jso
     let (config, mut row) = golden;
     row["metadata"]["user_api_key_user_id"] = Json::Null;
     let harness = harness(Store::default());
-    let mut request = success(&config, row, Some(0.25), "charge");
+    let mut request = success(&config, row, Some(0.25));
     request["identity"]["user_id"] = Json::Null;
-    request["enrich"] = json!({"resolve_missing_key_identity": true});
 
     let calls = run(&harness, input(Hook::AttemptEnded, request, None)).await;
 
@@ -417,7 +578,7 @@ async fn a_settle_once_job_row_is_claimed_through_the_ledger_store(
         accepts,
         ..Store::default()
     });
-    let mut request = success(&config, job_row(&row), Some(0.5), "charge");
+    let mut request = success(&config, job_row(&row), Some(0.5));
     request["call_type"] = json!("aretrieve_batch");
 
     let calls = run(&harness, input(Hook::AttemptEnded, request, None)).await;
@@ -492,11 +653,7 @@ async fn flush_drains_the_queue_into_the_store(golden: (Json, Json)) {
     let harness = harness(Store::default());
     run(
         &harness,
-        input(
-            Hook::AttemptEnded,
-            success(&config, row, Some(0.25), "charge"),
-            None,
-        ),
+        input(Hook::AttemptEnded, success(&config, row, Some(0.25)), None),
     )
     .await;
 

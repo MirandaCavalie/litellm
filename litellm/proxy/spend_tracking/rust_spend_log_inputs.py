@@ -2,14 +2,14 @@ import time
 import traceback
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
-from typing import Final, Literal
+from typing import Final
 
 import litellm
 from litellm._logging import redact_string
 from litellm._uuid import uuid
 from litellm.constants import BACKGROUND_INTERACTION_COST_POLLING_ENABLED
 from litellm.integrations.custom_logger_v2.field_sources import HookArgs
-from litellm.litellm_core_utils.batch_utils import defers_batch_cost, repeat_poll_cost
+from litellm.litellm_core_utils.batch_utils import defers_batch_cost
 from litellm.litellm_core_utils.core_helpers import (
     budget_reservation_from_metadata,
     finite_cost,
@@ -21,13 +21,11 @@ from litellm.proxy.auth.route_checks import RouteChecks
 from litellm.proxy.db.db_lookup_gate import DBLookupDeadlineExceeded
 from litellm.proxy.db.db_spend_update_writer import get_llm_router
 from litellm.proxy.hooks.proxy_track_cost_callback import (
-    _CAPTURED_IDENTITY_CALL_TYPES,  # pyright: ignore[reportPrivateUsage]  # the cost callback's own call type sets
-    _UNATTRIBUTED_TRACKABLE_CALL_TYPES,  # pyright: ignore[reportPrivateUsage]  # the cost callback's own call type sets
     ProxyDBLogger,
+    _batch_accounting_for,  # pyright: ignore[reportPrivateUsage]  # the cost callback's batch costing outcome
     _committed_spend_scope,  # pyright: ignore[reportPrivateUsage]  # the failure writer's committed twins
     _failure_snapshot_with_guardrails_recorded_after_it,  # pyright: ignore[reportPrivateUsage]  # the failure writer's own rows
     _failure_spend_rows,  # pyright: ignore[reportPrivateUsage]  # the failure writer's own rows
-    _get_request_tags_for_cost_tracking,  # pyright: ignore[reportPrivateUsage, reportUnknownVariableType]  # the cost callback's tag read
     _guardrail_info_lifted_from_litellm_metadata,  # pyright: ignore[reportPrivateUsage]  # the failure writer's own metadata
     _is_unbilled_in_progress_interaction,  # pyright: ignore[reportPrivateUsage]  # the cost callback's interaction checks
     _is_unbilled_interaction_response,  # pyright: ignore[reportPrivateUsage]  # the cost callback's interaction checks
@@ -52,10 +50,6 @@ from litellm.types.proxy.auth.user_api_key_auth import committed_budget_spend_of
 from litellm.utils import (
     get_end_user_id_for_cost_tracking,  # pyright: ignore[reportUnknownVariableType]  # the helper's dict parameter is untyped upstream
 )
-
-Disposition = Literal[
-    "charge", "defer_batch", "interaction_in_progress", "interaction_unbilled", "unpriced", "released"
-]
 
 
 def _local_now() -> datetime:
@@ -85,6 +79,8 @@ def _settings() -> Mapping[str, object]:
         "disable_responses_id_security": general.get("disable_responses_id_security") is True,
         "row_config": spend_log_row_config(),
         "proxy_budget_name": litellm_proxy_budget_name if litellm.max_budget > 0 else None,
+        "apply_search_free_tier": litellm.apply_search_free_tier is True,
+        "background_interaction_cost_polling": bool(BACKGROUND_INTERACTION_COST_POLLING_ENABLED),
     }
 
 
@@ -148,20 +144,9 @@ def _row(
     }
 
 
-def _disposition(kwargs: Mapping[str, object], response: object, cost: float | None, payload: object) -> Disposition:
-    if defers_batch_cost(kwargs, response):
-        return "defer_batch"
-    if cost is not None:
-        return "charge"
-    if _is_unbilled_interaction_response(response):
-        if BACKGROUND_INTERACTION_COST_POLLING_ENABLED and _is_unbilled_in_progress_interaction(response):
-            return "interaction_in_progress"
-        return "interaction_unbilled"
-    if payload is None and (not kwargs.get("model") or kwargs.get("call_type") == "_arealtime"):
-        return "released"
-    if kwargs.get("stream") is True and "complete_streaming_response" not in kwargs:
-        return "released"
-    return "unpriced"
+def _debug_info(payload: Mapping[str, object]) -> str | None:
+    info: Final = payload.get("response_cost_failure_debug_info")
+    return str(info) if info else None
 
 
 def spend_log_success_input(args: HookArgs) -> Mapping[str, object] | None:
@@ -175,9 +160,10 @@ def spend_log_success_input(args: HookArgs) -> Mapping[str, object] | None:
     )
     metadata: Final = _mapping(get_litellm_metadata_from_kwargs(dict(kwargs)))  # pyright: ignore[reportUnknownArgumentType]  # the metadata helper returns an untyped dict
     payload: Final = kwargs.get("standard_logging_object")
+    logged: Final = _mapping(payload)
     cost: Final = finite_cost(_mapping(payload if payload is not None else kwargs).get("response_cost"))
-    call_type: Final = _text(kwargs.get("call_type"))
     end_user_max_budget: Final = metadata.get("user_api_end_user_max_budget")
+    unbilled_interaction: Final = _is_unbilled_interaction_response(response)
     return {
         "kind": "success",
         "settings": _settings(),
@@ -191,15 +177,21 @@ def spend_log_success_input(args: HookArgs) -> Mapping[str, object] | None:
             "key_alias": _text(metadata.get("user_api_key_alias")),
             "agent_id": _text(metadata.get("billing_agent_id") or metadata.get("agent_id")),
         },
-        "enrich": {"resolve_missing_key_identity": str(call_type) not in _CAPTURED_IDENTITY_CALL_TYPES}
-        if metadata.get("user_api_key") and not metadata.get("user_api_key_user_id")
-        else None,
-        "disposition": _disposition(kwargs, response, cost, payload),
-        "call_type": call_type,
-        "tracks_unattributed": call_type in _UNATTRIBUTED_TRACKABLE_CALL_TYPES,
-        "tags": _get_request_tags_for_cost_tracking(payload, dict(metadata)),  # pyright: ignore[reportArgumentType]  # the logged payload dict
+        "call_type": _text(kwargs.get("call_type")),
+        "response": {
+            "defers_batch_cost": defers_batch_cost(kwargs, response),
+            "unbilled_interaction": unbilled_interaction,
+            "interaction_in_progress": unbilled_interaction and _is_unbilled_in_progress_interaction(response),
+        },
+        "payload": {
+            "cost_finalized": logged.get("cost_finalized") is True,
+            "cache_hit": bool(logged.get("cache_hit")),
+            "cost_failure_debug_info": _debug_info(logged),
+        },
+        "stream": kwargs.get("stream") is True,
+        "stream_complete": "complete_streaming_response" in kwargs,
         "end_user_max_budget": float(end_user_max_budget) if isinstance(end_user_max_budget, int | float) else None,
-        "repeat_poll_cost": repeat_poll_cost(call_type, cost, payload) if cost is not None else 0.0,
+        "batch_accounting": _batch_accounting_for(kwargs.get("litellm_call_id")) is not None,
         "window_resets": _window_resets(budget_reservation_from_metadata(dict(metadata))),
         "row": _row(kwargs, response, args.start_time, args.end_time, cost, _carried_committed(kwargs)),
     }
@@ -346,15 +338,9 @@ def spend_log_failure_input(args: HookArgs) -> Mapping[str, object] | None:
             "end_user_id": None if litellm.disable_end_user_cost_tracking else auth.end_user_id,
             "key_alias": auth.key_alias,
         },
-        "enrich": {"resolve_missing_key_identity": True}
-        if not isinstance(exception, DBLookupDeadlineExceeded)
-        else None,
+        "enrich": not isinstance(exception, DBLookupDeadlineExceeded),
         "completed_cost": completed_cost,
         "track": track,
-        "tags": _get_request_tags_for_cost_tracking(
-            built.get("standard_logging_object") if built is not None else None,  # pyright: ignore[reportArgumentType]  # the lifted failure payload dict
-            dict(_mapping(built.get("metadata"))) if built is not None else {},
-        ),
         "window_resets": _window_resets(auth.budget_reservation),
         "rows": [
             _row(row, exception, start_time, end_time, cost, list(_committed_spend_scope(auth).tracked()))

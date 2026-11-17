@@ -1,8 +1,11 @@
-//! The success and failure flows and `update_database`'s ledger half: gate, reconcile, build,
-//! claim or enqueue, then the counters and the host calls, in the cost callback's order.
+//! The success and failure flows and `update_database`'s ledger half: gate, search free tier,
+//! reconcile, build, claim or enqueue, then the counters and the host calls, in the cost
+//! callback's order.
+
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use litellm_callbacks::{BudgetReservation, Host};
-use litellm_callbacks_budgets::{CounterStep, CustomerWindow, post_call};
+use litellm_callbacks_budgets::{CounterStep, CustomerWindow, Failure as Failed, post_call};
 use litellm_python_compat::{
     Value,
     dict::{Dict, get, get_or_none},
@@ -14,11 +17,14 @@ use sha2::{Digest, Sha256};
 
 use super::{
     SpendLogCallback,
-    hook_input::{Disposition, Enrich, Failure, Identity, RowRequest, Settings, Success},
+    hook_input::{Failure, Identity, RowRequest, Settings, Success},
     host::{
-        AccountingContext, CustomerSpendAlert, EnrichKeyIdentity, EnrichedKeyIdentity,
-        IncrementProxySpend, SoftBudgetAlert,
+        AccountingContext, BatchAccounting, CachedSpendBump, CustomerSpendAlert, EnrichKeyIdentity,
+        EnrichedKeyIdentity, FailedTrackingAlert, IncrementProxySpend, IncrementSearchFreeTier,
+        SoftBudgetAlert,
     },
+    policy::{self, Disposition, RESPONSES_CALL_TYPES},
+    search_free_tier,
 };
 use crate::finalize_ledger_row;
 
@@ -39,7 +45,7 @@ struct Written {
     charged: bool,
     model_access_groups: Vec<String>,
     customer_windows: Vec<CustomerWindow>,
-    committed_tracked: Option<Vec<String>>,
+    committed_tracked: Vec<String>,
 }
 
 impl Written {
@@ -54,10 +60,44 @@ impl Written {
 /// Who and what one charged row's counter step charges.
 struct Charge<'a> {
     identity: &'a Identity,
-    tags: Option<&'a [String]>,
     row: &'a RowRequest,
     cost: f64,
     customer_hierarchy: bool,
+}
+
+/// What a success tells CheckBatchCost (`BatchAccountingOutcome`): whether the spend write began,
+/// and whether tracking failed.
+#[derive(Default)]
+struct BatchOutcome {
+    write_started: AtomicBool,
+    failed: AtomicBool,
+}
+
+impl BatchOutcome {
+    async fn report(&self, row: &Json, host: &Host) {
+        let write_started = self.write_started.load(Ordering::Relaxed);
+        let failed = self.failed.load(Ordering::Relaxed);
+        let Some(call_id) = row
+            .get("kwargs")
+            .and_then(|kwargs| kwargs.get("litellm_call_id"))
+            .and_then(Json::as_str)
+        else {
+            return;
+        };
+        if !(write_started || failed) {
+            return;
+        }
+        if let Err(error) = host
+            .call(BatchAccounting {
+                call_id: call_id.to_owned(),
+                write_started,
+                failed,
+            })
+            .await
+        {
+            tracing::debug!(%error, "the batch accounting host call failed");
+        }
+    }
 }
 
 fn sha256_hex(text: &str) -> String {
@@ -206,13 +246,13 @@ impl<S: LedgerStore + 'static> SpendLogCallback<S> {
         &self,
         host: &Host,
         identity: &Identity,
-        enrich: &Enrich,
+        resolve_missing_key_identity: bool,
     ) -> Option<EnrichedKeyIdentity> {
         let api_key = identity.token.clone()?;
         match host
             .call(EnrichKeyIdentity {
                 api_key,
-                resolve_missing_key_identity: enrich.resolve_missing_key_identity,
+                resolve_missing_key_identity,
                 key_alias: identity.key_alias.clone(),
                 user_id: identity.user_id.clone(),
                 team_id: identity.team_id.clone(),
@@ -240,6 +280,8 @@ impl<S: LedgerStore + 'static> SpendLogCallback<S> {
         }
     }
 
+    /// `_PROXY_track_cost_callback`: whatever it could not track raises the failed tracking
+    /// alert, and a batch's costing learns whether it may be retried.
     pub(super) async fn on_success(
         &self,
         success: Success,
@@ -248,8 +290,8 @@ impl<S: LedgerStore + 'static> SpendLogCallback<S> {
     ) {
         let mut success = success;
         let mut reservation = reservation;
-        if let Some(enrich) = success.enrich.clone()
-            && let Some(enriched) = self.enrich(host, &success.identity, &enrich).await
+        if let Some(resolve) = policy::enrich(&success)
+            && let Some(enriched) = self.enrich(host, &success.identity, resolve).await
         {
             enrich_row(&mut success.row, &enriched);
             let identity = &mut success.identity;
@@ -259,30 +301,99 @@ impl<S: LedgerStore + 'static> SpendLogCallback<S> {
             fill(&mut identity.org_id, &enriched.org_id);
             fill(&mut identity.project_id, &enriched.project_id);
         }
-        let resets = success.window_resets.clone();
-        match (success.disposition, success.row.response_cost) {
-            (Disposition::InteractionInProgress, _) => {}
-            (Disposition::Charge, Some(cost)) => {
-                if !tracked(&success) {
-                    self.release(&mut reservation, &resets).await;
-                    return;
-                }
-                if let Some(charged) = self
-                    .charge_request(&success, cost, &mut reservation, host)
-                    .await
-                {
-                    after_charge(&success, charged, host).await;
-                }
-            }
-            (Disposition::Unpriced, _) => {
-                self.release(&mut reservation, &resets).await;
-                tracing::error!(
-                    model = ?success.row.row.get("kwargs").and_then(|kwargs| kwargs.get("model")),
-                    "Error in tracking cost callback - Cost tracking failed, add custom pricing - https://docs.litellm.ai/docs/proxy/custom_pricing"
-                );
-            }
-            _ => self.release(&mut reservation, &resets).await,
+        let outcome = BatchOutcome::default();
+        if reservation.is_some() || success.settings.apply_search_free_tier {
+            outcome.write_started.store(true, Ordering::Relaxed);
         }
+        if let Err(error) = self
+            .track(&mut success, &mut reservation, &outcome, host)
+            .await
+        {
+            outcome.failed.store(true, Ordering::Relaxed);
+            failed_tracking_alert(&success, &error, host).await;
+        }
+        if success.batch_accounting {
+            outcome.report(&success.row.row, host).await;
+        }
+    }
+
+    async fn track(
+        &self,
+        success: &mut Success,
+        reservation: &mut Option<BudgetReservation>,
+        outcome: &BatchOutcome,
+        host: &Host,
+    ) -> Result<(), String> {
+        let resets = success.window_resets.clone();
+        match policy::disposition(success) {
+            Disposition::InteractionInProgress => Ok(()),
+            Disposition::Charge(cost) => {
+                let cost = if success.settings.apply_search_free_tier
+                    && !success.payload.cost_finalized
+                    && success
+                        .row
+                        .row
+                        .get("standard_logging_object")
+                        .is_some_and(|payload| !payload.is_null())
+                {
+                    self.search_free_tier(success, cost, host).await
+                } else {
+                    cost
+                };
+                if !tracked(success) {
+                    self.release(reservation, &resets).await;
+                    return Ok(());
+                }
+                let charged = self
+                    .charge_request(success, cost, reservation, outcome, host)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if let Some(charged) = charged {
+                    after_charge(success, charged, host).await;
+                }
+                Ok(())
+            }
+            Disposition::Unpriced => {
+                self.release(reservation, &resets).await;
+                Err(unpriced(success))
+            }
+            Disposition::DeferBatch | Disposition::InteractionUnbilled | Disposition::Released => {
+                self.release(reservation, &resets).await;
+                Ok(())
+            }
+        }
+    }
+
+    /// `apply_search_free_tier`: the cost after the grounding the free allowance covers. Any
+    /// counter failure bills the grounding at full price.
+    async fn search_free_tier(&self, success: &mut Success, cost: f64, host: &Host) -> f64 {
+        let now = chrono::Utc::now();
+        let Some(draw) = search_free_tier::draw(&success.row.row, success.payload.cache_hit, now)
+        else {
+            return cost;
+        };
+        let total_after = match host
+            .call(IncrementSearchFreeTier {
+                key: draw.key.clone(),
+                units: draw.units,
+                ttl: draw.ttl,
+            })
+            .await
+        {
+            Ok(Some(total_after)) => total_after,
+            Ok(None) => {
+                tracing::warn!(
+                    "apply_search_free_tier is on but the proxy has no Redis, grounding is billed at full price"
+                );
+                return cost;
+            }
+            Err(error) => {
+                tracing::warn!(%error, key = draw.key, "search free tier counter is unavailable, grounding is billed at full price");
+                return cost;
+            }
+        };
+        let discount = search_free_tier::discount(&draw, cost, total_after);
+        search_free_tier::apply(&mut success.row, cost, discount)
     }
 
     /// `_charge_request_cost`: what the request charged, trying the repeat poll's own cost when
@@ -292,9 +403,9 @@ impl<S: LedgerStore + 'static> SpendLogCallback<S> {
         success: &Success,
         cost: f64,
         reservation: &mut Option<BudgetReservation>,
+        outcome: &BatchOutcome,
         host: &Host,
-    ) -> Option<f64> {
-        let tags = success.tags.as_deref();
+    ) -> Result<Option<f64>, Failed> {
         if self
             .update_and_count(
                 &success.settings,
@@ -303,33 +414,35 @@ impl<S: LedgerStore + 'static> SpendLogCallback<S> {
                 cost,
                 reservation,
                 &success.window_resets,
-                tags,
+                outcome,
                 host,
             )
-            .await
+            .await?
         {
-            return Some(cost);
+            return Ok(Some(cost));
         }
-        let repeat = success.repeat_poll_cost;
+        let repeat = policy::repeat_poll_cost(success.call_type.as_deref(), cost, &success.row.row);
         if repeat <= 0.0 {
-            return None;
+            return Ok(None);
         }
-        self.update_and_count(
-            &success.settings,
-            &success.identity,
-            &repriced(&success.row, repeat),
-            repeat,
-            &mut None,
-            &[],
-            tags,
-            host,
-        )
-        .await
-        .then_some(repeat)
+        let charged = self
+            .update_and_count(
+                &success.settings,
+                &success.identity,
+                &repriced(&success.row, repeat),
+                repeat,
+                &mut None,
+                &[],
+                outcome,
+                host,
+            )
+            .await?;
+        Ok(charged.then_some(repeat))
     }
 
     /// `_update_database_and_spend_counters`: reconcile the reservation, write the row, release
-    /// the reservation when nothing was charged, then the counters.
+    /// the reservation when nothing was charged, then the counters, whose failure invalidates
+    /// the reserved counters and is raised.
     #[expect(
         clippy::too_many_arguments,
         reason = "one argument per value the Python function takes"
@@ -342,9 +455,9 @@ impl<S: LedgerStore + 'static> SpendLogCallback<S> {
         cost: f64,
         reservation: &mut Option<BudgetReservation>,
         window_resets: &[Option<String>],
-        tags: Option<&[String]>,
+        outcome: &BatchOutcome,
         host: &Host,
-    ) -> bool {
+    ) -> Result<bool, Failed> {
         if let Some(held) = reservation.as_mut()
             && let Err(error) =
                 post_call::reconcile(&self.budgets, held, window_resets, cost, false, false).await
@@ -353,16 +466,16 @@ impl<S: LedgerStore + 'static> SpendLogCallback<S> {
             post_call::invalidate(self.budgets.store(), held).await;
             held.finalized = Some(true);
         }
+        outcome.write_started.store(true, Ordering::Relaxed);
         let written = self
             .update_database(settings, identity, row, Some(cost), host)
             .await;
         if !written.charged {
             self.release(reservation, window_resets).await;
-            return false;
+            return Ok(false);
         }
         let charge = Charge {
             identity,
-            tags,
             row,
             cost,
             customer_hierarchy: true,
@@ -371,13 +484,13 @@ impl<S: LedgerStore + 'static> SpendLogCallback<S> {
             .count(host, &charge, written, reservation.as_mut(), window_resets)
             .await
         {
-            tracing::error!(%error, "Error in tracking cost callback - the spend counter update failed");
             if let Some(held) = reservation.as_mut() {
                 post_call::invalidate(self.budgets.store(), held).await;
                 held.finalized = Some(true);
             }
+            return Err(error);
         }
-        true
+        Ok(true)
     }
 
     /// `increment_spend_counters` on the ledger path: the whole post-call counter step in
@@ -389,7 +502,7 @@ impl<S: LedgerStore + 'static> SpendLogCallback<S> {
         written: Written,
         reservation: Option<&mut BudgetReservation>,
         window_resets: &[Option<String>],
-    ) -> Result<(), litellm_callbacks_budgets::Failure> {
+    ) -> Result<(), Failed> {
         let identity = charge.identity;
         let step = CounterStep {
             token: identity.token.clone(),
@@ -398,15 +511,10 @@ impl<S: LedgerStore + 'static> SpendLogCallback<S> {
             org_id: identity.org_id.clone(),
             end_user_id: identity.end_user_id.clone(),
             project_id: identity.project_id.clone(),
-            tags: charge
-                .tags
-                .map(|tags| tags.iter().cloned().map(Some).collect()),
+            tags: policy::tags(&charge.row.row).map(|tags| tags.into_iter().map(Some).collect()),
             model_access_groups: Some(written.model_access_groups.into_iter().map(Some).collect()),
             response_cost: Some(charge.cost),
-            committed_tracked: written
-                .committed_tracked
-                .or_else(|| charge.row.committed_tracked.clone())
-                .unwrap_or_default(),
+            committed_tracked: written.committed_tracked,
             customer_windows: written.customer_windows,
             customer_scopes: if charge.customer_hierarchy {
                 charge.row.customer_hierarchy.clone()
@@ -491,6 +599,8 @@ impl<S: LedgerStore + 'static> SpendLogCallback<S> {
         }
         let token = hashed_token(identity.token.as_deref());
         let charges = billable.is_some_and(|cost| cost != 0.0);
+        let responses_turn =
+            text(&row, "call_type").is_some_and(|kind| RESPONSES_CALL_TYPES.contains(&kind));
         let accounting = host
             .call(AccountingContext {
                 row: json::dumps(&row)?,
@@ -503,8 +613,9 @@ impl<S: LedgerStore + 'static> SpendLogCallback<S> {
                 model_access_groups: request.model_access_groups.clone(),
                 org_id: identity.org_id.clone(),
                 end_user_id: identity.end_user_id.clone(),
-                response_cost: billable,
-                committed: request.committed_tracked.clone(),
+                warm_committed: request.committed_tracked.is_none()
+                    && billable.is_some_and(|cost| cost > 0.0),
+                responses_turn,
             })
             .await?;
         let mut entities = Map::new();
@@ -549,16 +660,22 @@ impl<S: LedgerStore + 'static> SpendLogCallback<S> {
         let keep = !settings.disable_spend_logs
             && !(text(&finalized, "status") == Some("failure") && settings.disable_error_logs);
         Ok(Written {
-            charged: self.record(finalized, keep).await,
+            charged: self
+                .record(finalized, keep, accounting.chains_through_db)
+                .await,
             model_access_groups: accounting.model_access_groups,
             customer_windows: accounting.customer_windows,
-            committed_tracked: Some(accounting.committed_tracked),
+            committed_tracked: request
+                .committed_tracked
+                .clone()
+                .unwrap_or(accounting.committed_tracked),
         })
     }
 
     /// `_record_spend_log`: a settle-once job row claims its charge now, every other row is
-    /// queued, as an accounting-only row when request logs are off.
-    async fn record(&self, row: Value, keep: bool) -> bool {
+    /// queued, as an accounting-only row when request logs are off. A Responses turn the next
+    /// turn replays from the database wakes the writer at once.
+    async fn record(&self, row: Value, keep: bool, chains_through_db: bool) -> bool {
         if settles_once(&row) {
             return self.claim(row, keep).await;
         }
@@ -568,6 +685,9 @@ impl<S: LedgerStore + 'static> SpendLogCallback<S> {
             accounting_only(&row)
         };
         self.enqueue(stored);
+        if chains_through_db {
+            self.writer.request_flush();
+        }
         true
     }
 
@@ -634,28 +754,32 @@ impl<S: LedgerStore + 'static> SpendLogCallback<S> {
         if (failure.completed_cost && disabled) || !failure.track {
             return;
         }
-        if let Some(enrich) = failure.enrich.clone()
-            && let Some(enriched) = self.enrich(host, &failure.identity, &enrich).await
+        if failure.enrich
+            && let Some(enriched) = self.enrich(host, &failure.identity, true).await
         {
             for row in &mut failure.rows {
                 enrich_row(row, &enriched);
             }
         }
-        let tags = failure.tags.as_deref();
         if failure.completed_cost {
+            let outcome = BatchOutcome::default();
             for row in &failure.rows {
                 let cost = row.response_cost.unwrap_or(0.0);
-                self.update_and_count(
-                    &failure.settings,
-                    &failure.identity,
-                    row,
-                    cost,
-                    &mut reservation,
-                    &resets,
-                    tags,
-                    host,
-                )
-                .await;
+                if let Err(error) = self
+                    .update_and_count(
+                        &failure.settings,
+                        &failure.identity,
+                        row,
+                        cost,
+                        &mut reservation,
+                        &resets,
+                        &outcome,
+                        host,
+                    )
+                    .await
+                {
+                    tracing::error!(%error, "Failed to write the spend log for a failure with a completed cost");
+                }
             }
             return;
         }
@@ -681,7 +805,6 @@ impl<S: LedgerStore + 'static> SpendLogCallback<S> {
         for (row, cost, written) in counted {
             let charge = Charge {
                 identity: &failure.identity,
-                tags,
                 row,
                 cost,
                 customer_hierarchy: false,
@@ -704,7 +827,57 @@ fn tracked(success: &Success) -> bool {
         || identity.user_id.is_some()
         || identity.team_id.is_some()
         || identity.end_user_id.is_some()
-        || success.tracks_unattributed
+        || policy::tracks_unattributed(success.call_type.as_deref())
+}
+
+fn logged_model(row: &Json) -> String {
+    match policy::model(row) {
+        None => String::new(),
+        Some(Json::Null) => "None".to_owned(),
+        Some(Json::String(model)) => model.clone(),
+        Some(other) => other.to_string(),
+    }
+}
+
+/// The exception the cost callback raises for a priced call that lost its cost.
+fn unpriced(success: &Success) -> String {
+    let model = match policy::model(&success.row.row) {
+        Some(Json::String(model)) => model.clone(),
+        Some(Json::Null) | None => "None".to_owned(),
+        Some(other) => other.to_string(),
+    };
+    let has_payload = success
+        .row
+        .row
+        .get("standard_logging_object")
+        .is_some_and(|payload| !payload.is_null());
+    let debug_info = match (&success.payload.cost_failure_debug_info, has_payload) {
+        (_, false) => "standard_logging_object not found",
+        (Some(info), true) => info.as_str(),
+        (None, true) => "response_cost_failure_debug_info is None in standard_logging_object",
+    };
+    format!(
+        "Cost tracking failed for model={model}.\nDebug info - {debug_info}\nAdd custom pricing - https://docs.litellm.ai/docs/proxy/custom_pricing"
+    )
+}
+
+/// The cost callback's `except`: the failed tracking alert, fired and forgotten.
+async fn failed_tracking_alert(success: &Success, error: &str, host: &Host) {
+    tracing::error!(error, "Error in tracking cost callback");
+    let failing_model = logged_model(&success.row.row);
+    let call_type = success.call_type.as_deref().unwrap_or_default();
+    let error_message = format!(
+        "Error in tracking cost callback - {error}\n Traceback:raised in the Rust spend log callback\n Args to _PROXY_track_cost_callback\n model: {failing_model}\n call_type: {call_type}\n"
+    );
+    if let Err(error) = host
+        .call(FailedTrackingAlert {
+            error_message,
+            failing_model,
+        })
+        .await
+    {
+        tracing::debug!(%error, "the failed tracking alert host call failed");
+    }
 }
 
 /// The work `update_cache` and the cost callback leave to Python once a request is charged.
@@ -719,6 +892,18 @@ async fn after_charge(success: &Success, charged: f64, host: &Host) {
             .await
     {
         tracing::debug!(%error, "the soft budget alert host call failed");
+    }
+    if let Err(error) = host
+        .call(CachedSpendBump {
+            user_id: identity.user_id.clone(),
+            end_user_id: identity.end_user_id.clone(),
+            team_id: identity.team_id.clone(),
+            tags: policy::tags(&success.row.row),
+            response_cost: charged,
+        })
+        .await
+    {
+        tracing::debug!(%error, "the cached spend bump host call failed");
     }
     if success.settings.proxy_budget_name.is_some()
         && let Err(error) = host

@@ -6,13 +6,19 @@
 //! keeps the cost callback's order (`_update_database_and_spend_counters`):
 //!
 //! 1. the gate (`_should_track_cost_callback`) and the deferrals that release or keep the
-//!    budget reservation;
-//! 2. the reservation reconcile through `callbacks-budgets`;
+//!    budget reservation ([`policy`]);
+//! 2. the search free tier discount ([`search_free_tier`]) and the reservation reconcile through
+//!    `callbacks-budgets`;
 //! 3. the row from [`crate::SpendLogRowBuilder`] and its ledger columns;
 //! 4. the settle-once claim of a batch or video job's cost row, straight to the ledger store;
-//! 5. the enqueue into the Rust spend log writer;
-//! 6. the post-call counters, through the `callbacks-budgets` seam;
-//! 7. the host calls for the key soft budget alert, the proxy spend and the customer alert.
+//! 5. the enqueue into the Rust spend log writer, woken at once for a Responses turn the next
+//!    turn reads back from the database;
+//! 6. the post-call counters, through `Budgets::charge_counters`;
+//! 7. the host calls for the key soft budget alert, the cached spend, the proxy spend and the
+//!    customer alert.
+//!
+//! A cost it cannot track raises the failed tracking alert, and a batch's costing hears whether
+//! the spend write began and whether tracking failed.
 //!
 //! Python hands over what it alone holds through the `spend_log_input` field
 //! ([`hook_input::SpendLogInput`]) and answers the host calls in [`host`].
@@ -20,6 +26,8 @@
 mod charge;
 pub mod hook_input;
 pub mod host;
+mod policy;
+mod search_free_tier;
 
 use std::sync::{Arc, Mutex, PoisonError};
 

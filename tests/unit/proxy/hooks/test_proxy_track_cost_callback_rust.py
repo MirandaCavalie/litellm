@@ -3,6 +3,7 @@ path. Each path writes into its own Rust spend log writer over an unreachable da
 and the test reads them back."""
 
 import asyncio
+import copy
 import json
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from datetime import datetime, timezone
@@ -13,18 +14,15 @@ import pytest_asyncio
 
 import litellm
 import litellm.proxy.proxy_server as ps
-from litellm.integrations.custom_logger_v2.enums import Field, Hook
-from litellm.integrations.custom_logger_v2.field_sources import HookArgs
+from litellm.integrations.custom_logger_v2.enums import Hook
 from litellm.integrations.custom_logger_v2.rust import RustLogger
-from litellm.litellm_core_utils.litellm_logging import V2_ASYNC_LOGGING_LINE
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.db.native_database import ServiceLoggingEvents, native_endpoint
 from litellm.proxy.db.rust_spend_log_writer import install_rust_spend_log_writer, uninstall_rust_spend_log_writer
-from litellm.proxy.hooks.rust_spend_logger import CachedSpendBumps, rust_spend_loggers, spend_logger
-from litellm.proxy.spend_tracking.rust_spend_log_inputs import spend_log_success_input
+from litellm.proxy.hooks.proxy_track_cost_callback import track_batch_accounting
+from litellm.proxy.hooks.rust_spend_logger import rust_spend_loggers, spend_logger
 from litellm.proxy.utils import BilledFailedAttempt, PrismaClient, ProxyUpdateSpend
 from litellm.rust_bridge._native import NativeDatabase, NativeSpendCounters, RustSpendLogWriter
-from litellm.types.integrations.custom_logger_v2 import Outcome
 from tests.unit.proxy.db.test_rust_spend_log_writer import FakePrismaClient
 from tests.unit.proxy.hooks.rust_spend_logger_twin import (
     Completion,
@@ -88,11 +86,13 @@ async def paths(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[Paths]:
     assert legacy is not None and rust is not None
     monkeypatch.setattr(ps, "prisma_client", legacy_client)
     monkeypatch.setattr(ps, "general_settings", {"use_spend_logs_ledger": True})
+    monkeypatch.setattr(ps.proxy_logging_obj.slack_alerting_instance, "alerting", [])
     try:
         yield Paths(legacy_client, legacy, rust)
     finally:
         uninstall_rust_spend_log_writer(legacy_client)
         uninstall_rust_spend_log_writer(rust_client)
+        ps.spend_counter_store.flush_local()
 
 
 async def _both_succeed(
@@ -236,30 +236,135 @@ async def test_an_untracked_failure_route_queues_no_row(paths: Paths) -> None:
 
 
 @pytest.mark.asyncio
-async def test_the_cached_spend_bump_adds_the_charge_to_the_cached_team(
+async def test_the_cached_spend_bump_adds_the_same_charge_on_both_paths(
     paths: Paths, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     added: Final[list[tuple[object, ...]]] = []
     monkeypatch.setattr(ps, "add_spend_to_cached_spend_objects", lambda *args: added.append(args[1:]))
+    done: Final = await completion({**_KEYED, "tags": ["blue"]})
+
+    await legacy_success(done)
+    await _settle_background_tasks()
+    legacy: Final = list(added)
+    added.clear()
+    await rust_success(paths.logger, done)
+    await _settle_background_tasks()
+
+    assert len(legacy) == 1
+    assert added == legacy
+
+
+async def _settle_background_tasks() -> None:
+    for _ in range(20):
+        await asyncio.sleep(0)
+
+
+class _AllowanceCounter:
+    def __init__(self, used: float) -> None:
+        self.used = used
+        self.increments: list[tuple[str, float, int | None]] = []
+
+    async def async_increment(self, key: str, value: float, ttl: int | None = None) -> float:
+        self.increments.append((key, value, ttl))
+        self.used += value
+        return self.used
+
+
+def _grounded(done: Completion) -> Completion:
+    kwargs: Final = copy.deepcopy(dict(done.kwargs))
+    payload: Final = kwargs["standard_logging_object"]
+    assert isinstance(payload, dict)
+    payload["custom_llm_provider"] = "gemini"
+    payload["model_map_information"] = {
+        "model_map_key": "gemini-3-pro",
+        "model_map_value": {
+            "litellm_provider": "vertex_ai",
+            "web_search_billing_unit": "per_query",
+            "search_context_cost_per_query": {"search_context_size_medium": 1e-6},
+            "search_free_requests": {"count": 5, "period": "day", "shared_group": "gemini-3"},
+        },
+    }
+    response: Final = copy.deepcopy(done.response)
+    assert isinstance(response, litellm.ModelResponse)
+    response.usage.prompt_tokens_details = litellm.types.utils.PromptTokensDetailsWrapper(web_search_requests=3)  # pyright: ignore[reportAttributeAccessIssue]  # the mock usage gains a grounding count
+    return Completion(kwargs, response, done.start_time, done.end_time)
+
+
+@pytest.mark.asyncio
+async def test_grounding_under_the_free_allowance_is_discounted_the_same_on_both_paths(
+    paths: Paths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(litellm, "apply_search_free_tier", True)
+    dual_cache: Final = ps.proxy_logging_obj.internal_usage_cache.dual_cache
+    done: Final = _grounded(await completion(_KEYED))
+    legacy_counter: Final = _AllowanceCounter(used=3)
+    rust_counter: Final = _AllowanceCounter(used=3)
+
+    monkeypatch.setattr(dual_cache, "redis_cache", legacy_counter)
+    await legacy_success(done)
+    monkeypatch.setattr(dual_cache, "redis_cache", rust_counter)
+    await rust_success(paths.logger, done)
+    legacy: Final = paths.legacy_rows()
+    rust: Final = paths.rust_rows()
+
+    assert [without(row, _VOLATILE) for row in rust] == [without(row, _VOLATILE) for row in legacy]
+    assert float(str(rust[0]["spend"])) < float(str(done.kwargs["response_cost"]))
+    ((legacy_key, legacy_units, legacy_ttl),) = legacy_counter.increments
+    ((rust_key, rust_units, rust_ttl),) = rust_counter.increments
+    assert (rust_key, rust_units) == (legacy_key, legacy_units)
+    assert legacy_ttl is not None and rust_ttl is not None and abs(rust_ttl - legacy_ttl) <= 2
+
+
+def _unpriced(done: Completion) -> Completion:
+    kwargs: Final = copy.deepcopy(dict(done.kwargs))
+    payload: Final = kwargs["standard_logging_object"]
+    assert isinstance(payload, dict)
+    payload["response_cost"] = None
+    payload["response_cost_failure_debug_info"] = {"error_str": "no price for this model"}
+    kwargs["response_cost"] = None
+    return Completion(kwargs, done.response, done.start_time, done.end_time)
+
+
+def _without_traceback(message: str) -> tuple[str, str]:
+    head, _, rest = message.partition("\n Traceback:")
+    return head, rest[rest.index("\n Args to") :]
+
+
+@pytest.mark.asyncio
+async def test_an_unpriced_completion_raises_the_same_failed_tracking_alert(
+    paths: Paths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    alerts: Final[list[tuple[str, str]]] = []
+
+    async def failed_tracking_alert(error_message: str, failing_model: str) -> None:
+        alerts.append((error_message, failing_model))
+
+    monkeypatch.setattr(ps.proxy_logging_obj, "failed_tracking_alert", failed_tracking_alert)
+    done: Final = _unpriced(await completion(_KEYED))
+
+    await legacy_success(done)
+    await rust_success(paths.logger, done)
+    await _settle_background_tasks()
+
+    ((legacy_message, legacy_model), (rust_message, rust_model)) = alerts
+    assert rust_model == legacy_model == "gpt-4o"
+    assert _without_traceback(rust_message) == _without_traceback(legacy_message)
+    assert (paths.legacy_rows(), paths.rust_rows()) == ([], [])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("priced", [pytest.param(True, id="priced"), pytest.param(False, id="unpriced")])
+async def test_a_batch_costing_hears_the_same_outcome_from_both_paths(paths: Paths, priced: bool) -> None:
     done: Final = await completion(_KEYED)
-    document: Final = spend_log_success_input(
-        HookArgs(request=dict(done.kwargs), result=done.response, start_time=done.start_time, end_time=done.end_time)
-    )
-    view: Final = type("View", (), {Field.spend_log_input.value: document, Field.outcome.value: Outcome.success})()
-    line: Final = V2_ASYNC_LOGGING_LINE.set(True)
-    try:
-        await CachedSpendBumps().on_attempt_ended(view, None)  # pyright: ignore[reportArgumentType]  # the handler reads no context
-    finally:
-        V2_ASYNC_LOGGING_LINE.reset(line)
+    request: Final = done if priced else _unpriced(done)
+    call_id: Final = str(request.kwargs["litellm_call_id"])
 
-    assert document is not None
-    assert added == [("user-1", None, "team-1", [], _row_cost(document))]
+    with track_batch_accounting(call_id) as legacy:
+        await legacy_success(request)
+    with track_batch_accounting(call_id) as rust:
+        await rust_success(paths.logger, request)
 
-
-def _row_cost(document: Mapping[str, object]) -> object:
-    row: Final = document["row"]
-    assert isinstance(row, Mapping)
-    return row["response_cost"]  # pyright: ignore[reportUnknownVariableType]  # the derivation's row request
+    assert (rust.write_started, rust.failed) == (legacy.write_started, legacy.failed) == (priced, not priced)
 
 
 @pytest.mark.asyncio
@@ -267,9 +372,7 @@ async def test_the_proxy_registers_the_rust_callback_only_over_a_rust_writer(pat
     registered: Final = rust_spend_loggers(paths.legacy_client)
     missing: Final = rust_spend_loggers(object())
 
-    assert registered is not None and missing is None
-    rust, bumps = registered
-    assert isinstance(rust, RustLogger) and isinstance(bumps, CachedSpendBumps)
-    assert rust.selection.name == "spend_log"
-    assert callable(getattr(rust, f"on_{Hook.attempt_ended.value}"))
-    assert callable(getattr(rust, f"on_{Hook.post_call_failure.value}"))
+    assert isinstance(registered, RustLogger) and missing is None
+    assert registered.selection is not None and registered.selection.name == "spend_log"
+    assert hasattr(registered, f"on_{Hook.attempt_ended.value}")
+    assert hasattr(registered, f"on_{Hook.post_call_failure.value}")

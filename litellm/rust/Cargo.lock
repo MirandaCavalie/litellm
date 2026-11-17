@@ -3860,6 +3860,7 @@ name = "litellm-callbacks-spend-log"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "chrono",
  "fancy-regex 0.19.2",
  "futures-util",
  "litellm-callbacks",
