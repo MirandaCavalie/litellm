@@ -743,6 +743,18 @@ class RustSpendLogWriter:
     ) -> Future[None]: ...
 
 @final
+class RustSpendLog:
+    def __new__(
+        cls,
+        writer: RustSpendLogWriter,
+        spend_counters: NativeSpendCounters,
+        minimum_custom_key_length: int,
+        word_ranges: Sequence[tuple[int, int]],
+        retention: tuple[Sequence[str] | None, Sequence[str] | None, Sequence[str]] | None = None,
+    ) -> RustSpendLog: ...
+    def callback(self) -> RustHandle: ...
+
+@final
 class NativeTokenRedactor:
     def __new__(cls, minimum_custom_key_length: int, word_ranges: Sequence[tuple[int, int]]) -> NativeTokenRedactor: ...
     def redact(self, text: str, replacement: str) -> str | None: ...

@@ -47,6 +47,9 @@ pub struct RowRequest {
     pub model_access_groups: Vec<String>,
     /// `customer_hierarchy_ids_from_request(...).entities()`.
     pub customer_entities: Option<serde_json::Map<String, Value>>,
+    /// `customer_budget_scopes_from_request`, the customer scopes admission granted, each as
+    /// its JSON record, or `None` when the request carries no snapshot.
+    pub customer_scopes: Option<Vec<Value>>,
 }
 
 /// How the success callback treats a request before any charge.
@@ -62,8 +65,10 @@ pub enum Disposition {
     InteractionInProgress,
     /// An interaction create with no usage that no poll task settles.
     InteractionUnbilled,
-    /// No cost and nothing to defer.
+    /// No cost and nothing to defer: an error, since a priced call lost its cost.
     Unpriced,
+    /// No cost and nothing to charge: a call with no logging payload, or a stream still running.
+    Released,
 }
 
 /// Key identity enrichment from the key and team cache when the key carries no user.

@@ -21,6 +21,7 @@ mod router;
 mod routes;
 mod s3_log;
 mod secrets;
+mod spend_log;
 mod spend_log_rows;
 mod spend_log_writer;
 mod tokenizer;
@@ -122,6 +123,8 @@ mod _native {
     use crate::routes::traces::trace_encode_error;
     #[pymodule_export]
     use crate::s3_log::NativeS3Log;
+    #[pymodule_export]
+    use crate::spend_log::RustSpendLog;
     #[pymodule_export]
     use crate::spend_log_rows::RustSpendLogRowBuilder;
     #[pymodule_export]
@@ -237,6 +240,7 @@ mod tests {
                 "NativeBudgets",
                 "budget_check_decision",
                 "NativeS3Log",
+                "RustSpendLog",
                 "RustSpendLogWriter",
                 "RustSpendLogWriteFailure",
                 "auth_allowed_routes_grant",

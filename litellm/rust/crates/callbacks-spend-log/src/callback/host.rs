@@ -50,6 +50,7 @@ pub struct AccountingContext {
     pub user_id: Option<String>,
     pub windows: bool,
     pub customer: Option<Map<String, Value>>,
+    pub customer_scopes: Option<Vec<Value>>,
     pub model_access_groups: Vec<String>,
 }
 

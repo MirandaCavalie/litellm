@@ -3456,11 +3456,28 @@ def load_from_azure_key_vault(use_azure_key_vault: bool = False):
 spend_event_producer: SpendEventProducer | None = None
 
 
+def _register_rust_spend_loggers() -> bool:
+    if general_settings_view().get("use_spend_logs_ledger", True) is False:
+        return False
+    from litellm.proxy.hooks.rust_spend_logger import rust_spend_loggers
+
+    loggers: Final = rust_spend_loggers(prisma_client)
+    if loggers is None:
+        return False
+    for logger in loggers:
+        litellm.logging_callback_manager.add_litellm_callback(logger)  # pyright: ignore[reportArgumentType]  # the callback list also holds V2 callbacks
+        litellm.logging_callback_manager.add_litellm_async_success_callback(logger)
+    return True
+
+
 def cost_tracking():
     global prisma_client, spend_event_producer
     if prisma_client is not None:
         from litellm.integrations.shadow_eval_logger import ShadowEvalLogger
 
+        if _register_rust_spend_loggers():
+            litellm.logging_callback_manager.add_litellm_callback(ShadowEvalLogger())
+            return
         spend_event_producer = build_spend_event_producer(CollectorSettings(), fallback=run_spend_event)
         db_logger: Final = ProxyDBLogger(spend_event_producer)
         litellm.logging_callback_manager.add_litellm_callback(db_logger)
@@ -5122,74 +5139,56 @@ async def _add_spend_to_global_proxy_spend(cache: UserApiKeyCache, response_cost
     )
 
 
-async def update_cache(
-    token: str | None,
+async def projected_soft_budget_alert(target: UserApiKeyCache, token: str, response_cost: float) -> None:
+    hashed_token: Final = hash_token(token=token) if isinstance(token, str) and token.startswith("sk-") else token
+    verbose_proxy_logger.debug("_update_key_cache: hashed_token=%s", hashed_token)
+    existing_spend_obj: Final = await target.async_get_cache(key=hashed_token, model_type=UserAPIKeyAuth)
+    verbose_proxy_logger.debug("_update_key_cache: existing_spend_obj=%s", existing_spend_obj)
+    if existing_spend_obj is None:
+        return
+
+    existing_spend: Final = existing_spend_obj.spend or 0.0
+    new_spend: Final = existing_spend + response_cost
+
+    projection: Final = (
+        get_projected_spend_over_limit(
+            current_spend=new_spend,
+            soft_budget_limit=existing_spend_obj.soft_budget,
+            budget_duration=existing_spend_obj.budget_duration,
+            budget_reset_at=existing_spend_obj.budget_reset_at,
+        )
+        if existing_spend_obj.soft_budget_cooldown is False and existing_spend_obj.soft_budget is not None
+        else None
+    )
+    if projection is not None:
+        projected_spend, projected_exceeded_date = projection
+        soft_limit: Final = existing_spend_obj.soft_budget
+        call_info: Final = CallInfo(
+            token=existing_spend_obj.token or "",
+            spend=new_spend,
+            key_alias=existing_spend_obj.key_alias,
+            max_budget=soft_limit,
+            user_id=existing_spend_obj.user_id,
+            projected_spend=projected_spend,
+            projected_exceeded_date=str(projected_exceeded_date),
+            event_group=Litellm_EntityType.KEY,
+        )
+        asyncio.create_task(
+            proxy_logging_obj.budget_alerts(
+                type="projected_limit_exceeded",
+                user_info=call_info,
+            )
+        )
+
+
+def add_spend_to_cached_spend_objects(
+    target: UserApiKeyCache,
     user_id: str | None,
     end_user_id: str | None,
     team_id: str | None,
-    response_cost: float | None,
-    parent_otel_span: Span | None,
-    tags: list[str] | None = None,
-    cache: UserApiKeyCache | None = None,
-):
-    """
-    Use this to update the cache with new user spend.
-
-    Put any alerting logic in here.
-    """
-
-    target: Final = user_api_key_cache if cache is None else cache
-
-    ### UPDATE KEY SPEND ###
-    async def _update_key_cache(token: str, response_cost: float):
-        # Fetch the existing cost for the given token
-        if isinstance(token, str) and token.startswith("sk-"):
-            hashed_token = hash_token(token=token)
-        else:
-            hashed_token = token
-        verbose_proxy_logger.debug("_update_key_cache: hashed_token=%s", hashed_token)
-        existing_spend_obj = await target.async_get_cache(key=hashed_token, model_type=UserAPIKeyAuth)
-        verbose_proxy_logger.debug("_update_key_cache: existing_spend_obj=%s", existing_spend_obj)
-        if existing_spend_obj is None:
-            return
-
-        existing_spend: Final = existing_spend_obj.spend or 0.0
-        # Calculate the new cost by adding the existing cost and response_cost
-        new_spend: Final = existing_spend + response_cost
-
-        ## CHECK IF USER PROJECTED SPEND > SOFT LIMIT
-        projection: Final = (
-            get_projected_spend_over_limit(
-                current_spend=new_spend,
-                soft_budget_limit=existing_spend_obj.soft_budget,
-                budget_duration=existing_spend_obj.budget_duration,
-                budget_reset_at=existing_spend_obj.budget_reset_at,
-            )
-            if existing_spend_obj.soft_budget_cooldown is False and existing_spend_obj.soft_budget is not None
-            else None
-        )
-        if projection is not None:
-            projected_spend, projected_exceeded_date = projection
-            soft_limit: Final = existing_spend_obj.soft_budget
-            call_info: Final = CallInfo(
-                token=existing_spend_obj.token or "",
-                spend=new_spend,
-                key_alias=existing_spend_obj.key_alias,
-                max_budget=soft_limit,
-                user_id=existing_spend_obj.user_id,
-                projected_spend=projected_spend,
-                projected_exceeded_date=str(projected_exceeded_date),
-                event_group=Litellm_EntityType.KEY,
-            )
-            # alert user
-            asyncio.create_task(
-                proxy_logging_obj.budget_alerts(
-                    type="projected_limit_exceeded",
-                    user_info=call_info,
-                )
-            )
-            # set cooldown on alert
-
+    tags: Sequence[str] | None,
+    response_cost: float,
+) -> None:
     def _add_spend(key: str, model_type: type[_CachedSpendObjectT], cost: float) -> None:
         try:
             _add_spend_to_locally_cached_object(target, key, model_type, cost)
@@ -5205,12 +5204,6 @@ async def update_cache(
                 traceback.format_exc(),
             )
 
-    with service_target(AUTH_OBJECTS_TARGET):
-        if token is not None and response_cost is not None:
-            await _update_key_cache(token=token, response_cost=response_cost)
-    if response_cost is None:
-        return
-
     if user_id is not None:
         _add_spend(user_id, LiteLLM_UserTable, response_cost)
     if end_user_id is not None:
@@ -5221,10 +5214,32 @@ async def update_cache(
         if tag_name and isinstance(tag_name, str):
             _add_spend(tag_cache_key(tag_name), LiteLLM_TagTable, response_cost)
 
+
+async def add_spend_to_budgeted_global_proxy_spend(target: UserApiKeyCache, response_cost: float) -> None:
     if litellm.max_budget <= 0:
         return
     with service_target(SPEND_COUNTERS_TARGET):
         await _add_spend_to_global_proxy_spend(target, response_cost)
+
+
+async def update_cache(
+    token: str | None,
+    user_id: str | None,
+    end_user_id: str | None,
+    team_id: str | None,
+    response_cost: float | None,
+    parent_otel_span: Span | None,
+    tags: list[str] | None = None,
+    cache: UserApiKeyCache | None = None,
+):
+    target: Final = user_api_key_cache if cache is None else cache
+    with service_target(AUTH_OBJECTS_TARGET):
+        if token is not None and response_cost is not None:
+            await projected_soft_budget_alert(target, token, response_cost)
+    if response_cost is None:
+        return
+    add_spend_to_cached_spend_objects(target, user_id, end_user_id, team_id, tags, response_cost)
+    await add_spend_to_budgeted_global_proxy_spend(target, response_cost)
 
 
 def run_ollama_serve():

@@ -435,6 +435,7 @@ impl<S: LedgerStore + 'static> SpendLogCallback<S> {
                 user_id: identity.user_id.clone(),
                 windows: charges,
                 customer: request.customer_entities.clone(),
+                customer_scopes: request.customer_scopes.clone(),
                 model_access_groups: request.model_access_groups.clone(),
             })
             .await?;
