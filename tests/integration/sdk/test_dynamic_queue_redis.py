@@ -34,10 +34,10 @@ from litellm.router_utils.dynamic_queue import (
     WaitRequest,
 )
 from litellm.router_utils.dynamic_queue_redis import RedisQueueBackend, _keys
-from litellm.router_utils.dynamic_queue_router import MAX_WAITING_LIMIT
 from tests.unit.router_utils.test_dynamic_queue import ManualTimer, _reap
 
 FAR: Final = 1_000_000
+CONFIGURED_SIZE: Final = 64
 
 
 class SharedClock:
@@ -562,13 +562,13 @@ async def test_a_ready_waiter_behind_more_cooling_waiters_than_one_sweep_still_g
 
 
 @pytest.mark.asyncio
-async def test_a_queue_at_the_largest_supported_size_still_probes_its_last_ready_waiter_and_refuses_one_more(
+async def test_a_queue_filled_to_its_configured_size_still_probes_its_last_ready_waiter_and_refuses_one_more(
     capacity: str, workers: WorkerFactory
 ) -> None:
     clock: Final = SharedClock()
-    first, second = workers.pair(clock, max_waiting=MAX_WAITING_LIMIT, liveness_ms=FAR)
+    first, second = workers.pair(clock, max_waiting=CONFIGURED_SIZE, liveness_ms=FAR)
     await _congest(first, capacity)
-    for index in range(MAX_WAITING_LIMIT - 1):
+    for index in range(CONFIGURED_SIZE - 1):
         reply = await first.admit(WaitRequest(capacity, f"cooling-{index}", 0), FAR, ready_in_ms=FAR)
         assert reply == Waiting(probe_in_ms=1_000), (index, reply)
     assert await second.admit(WaitRequest(capacity, "ready", 9), FAR) == Waiting(probe_in_ms=1_000)
