@@ -660,17 +660,17 @@ class NativeBudgets:
         actual: float,
         apply_consistent: bool,
     ) -> Future[JsonValue]: ...
+    def charge_counters(
+        self,
+        step: Mapping[str, object],
+        record: BudgetReservation | None,
+        reservation: dict[str, object] | None,
+        request: NativeRequestRedis | None,
+        host: object,
+        /,
+    ) -> Execution: ...
 
 def budget_check_decision(check: BudgetCheck) -> JsonValue: ...
-def spend_counter_plan(charge: Mapping[str, object]) -> JsonValue: ...
-def spend_counter_keys(charge: Mapping[str, object]) -> JsonValue: ...
-def committed_spend_counter_keys(tracked: Sequence[str], response_cost: float | None) -> list[str]: ...
-def budget_window_counters(
-    entity_type: str, entity_id: str, durations: Sequence[str], reserved_counter_keys: Sequence[str]
-) -> JsonValue: ...
-def customer_spend_settlement(
-    scopes: Sequence[Mapping[str, object]], readings: Sequence[float | None], cost: float
-) -> JsonValue: ...
 
 @final
 class NativeSpendCounters:
@@ -1022,11 +1022,8 @@ __all__ = [
     "auth_route_matches_prefix",
     "auth_route_matches_wildcard",
     "budget_check_decision",
-    "budget_window_counters",
     "bundled_model_cost_map",
-    "committed_spend_counter_keys",
     "completion",
-    "customer_spend_settlement",
     "embedding",
     "gil_stats",
     "messages",
@@ -1037,8 +1034,6 @@ __all__ = [
     "process_state_started",
     "reserve_process_for_forking",
     "responses",
-    "spend_counter_keys",
-    "spend_counter_plan",
     "trace_encode_error",
     "transcription",
     "unsupported_tls_settings",

@@ -7,5 +7,5 @@ globals().update(ledger_scenarios(scenarios))
 
 
 @pytest.fixture(autouse=True)
-def _ledger_windows(monkeypatch: pytest.MonkeyPatch) -> None:
+def ledger_windows(monkeypatch: pytest.MonkeyPatch) -> None:
     force_ledger_windows(monkeypatch)

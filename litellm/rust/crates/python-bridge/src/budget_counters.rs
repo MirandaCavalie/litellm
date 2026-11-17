@@ -1,57 +1,83 @@
-//! The post-call spend counter fan-out from `litellm-callbacks-budgets`, exposed as plain functions
-//! that take and return Python dicts and lists. The proxy validates each reply into typed models.
+//! The post-call spend counter step from `litellm-callbacks-budgets`, run as a Python execution.
+//!
+//! The step's host calls go to the Python host object, awaited in the caller's task. When the step
+//! finishes, its stamps land on the caller's shared reservation dict, a post-call pipeline that
+//! carried committed twins is handed to the host's `track_post_call_settlement`, and the step's
+//! first failure is raised.
+
+use std::sync::Arc;
 
 use litellm_callbacks_budgets::{
-    Charge, CustomerScopeSpend, WindowedEntity, committed_counter_keys, customer_settlement, plan,
-    post_call_counter_keys, window_counters,
+    BudgetReservation, Budgets, CounterError, CounterOutcome, CounterStep, Failure,
 };
-use litellm_host_python::{from_py_argument, to_py};
-use pyo3::prelude::*;
+use litellm_callbacks_python::{host_call_error, run_hosted};
+use litellm_host_python::Execution;
+use litellm_redis_store::RequestRedis;
+use pyo3::{
+    exceptions::PyValueError,
+    prelude::*,
+    types::{PyDict, PyList},
+};
 
-#[pyfunction]
-pub(crate) fn spend_counter_plan(
-    py: Python<'_>,
-    #[pyo3(from_py_with = from_py_argument)] charge: Charge,
-) -> PyResult<Py<PyAny>> {
-    to_py(py, &plan(&charge))
+use crate::redis::store::{spend_counters::PyPostCallSettlement, store_error};
+
+fn failure_error(failure: &Failure) -> PyErr {
+    match &**failure {
+        CounterError::Host(error) => host_call_error(error),
+        CounterError::Store(error) => store_error(error),
+        CounterError::Counter(error) => PyValueError::new_err(error.to_string()),
+    }
 }
 
-#[pyfunction]
-pub(crate) fn spend_counter_keys(
-    py: Python<'_>,
-    #[pyo3(from_py_with = from_py_argument)] charge: Charge,
-) -> PyResult<Py<PyAny>> {
-    to_py(py, &post_call_counter_keys(&charge))
+/// Writes each entry's `applied_adjustment` and the `finalized` flag the way the proxy's
+/// `stamp_budget_reservation_actual_cost` and the fan-out's last step do.
+fn stamp(reservation: &Bound<'_, PyDict>, outcome: &CounterOutcome) -> PyResult<()> {
+    if let Some(entries) = reservation.get_item("entries")?
+        && let Ok(entries) = entries.cast::<PyList>()
+    {
+        for (entry, stamp) in entries.iter().zip(&outcome.stamps) {
+            if let (Some(stamp), Ok(entry)) = (stamp, entry.cast::<PyDict>()) {
+                entry.set_item("applied_adjustment", *stamp)?;
+            }
+        }
+    }
+    if outcome.finalized {
+        reservation.set_item("finalized", true)?;
+    }
+    Ok(())
 }
 
-#[pyfunction]
-pub(crate) fn committed_spend_counter_keys(
-    tracked: Vec<String>,
-    response_cost: Option<f64>,
-) -> Vec<String> {
-    committed_counter_keys(&tracked, response_cost)
-}
-
-#[pyfunction]
-pub(crate) fn budget_window_counters(
-    py: Python<'_>,
-    #[pyo3(from_py_with = from_py_argument)] entity_type: WindowedEntity,
-    entity_id: &str,
-    durations: Vec<String>,
-    reserved_counter_keys: Vec<String>,
-) -> PyResult<Py<PyAny>> {
-    to_py(
-        py,
-        &window_counters(entity_type, entity_id, &durations, &reserved_counter_keys),
+/// Starts the counter step for `step` as an execution the proxy drives.
+pub(crate) fn start(
+    budgets: Arc<Budgets>,
+    step: CounterStep,
+    record: Option<BudgetReservation>,
+    reservation: Option<Py<PyDict>>,
+    request: Option<RequestRedis>,
+    host: Py<PyAny>,
+) -> Execution {
+    let tracker = Python::attach(|py| host.clone_ref(py));
+    run_hosted(
+        move |host| async move {
+            budgets
+                .charge_counters(&host, request.as_ref(), &step, record.as_ref())
+                .await
+        },
+        host,
+        move |py, outcome: CounterOutcome| {
+            if let Some(reservation) = &reservation {
+                stamp(reservation.bind(py), &outcome)?;
+            }
+            if let Some(settlement) = outcome.committed_settlement.clone() {
+                tracker.bind(py).call_method1(
+                    "track_post_call_settlement",
+                    (PyPostCallSettlement(settlement),),
+                )?;
+            }
+            match &outcome.error {
+                Some(failure) => Err(failure_error(failure)),
+                None => Ok(py.None()),
+            }
+        },
     )
-}
-
-#[pyfunction]
-pub(crate) fn customer_spend_settlement(
-    py: Python<'_>,
-    #[pyo3(from_py_with = from_py_argument)] scopes: Vec<CustomerScopeSpend>,
-    readings: Vec<Option<f64>>,
-    cost: f64,
-) -> PyResult<Py<PyAny>> {
-    to_py(py, &customer_settlement(&scopes, &readings, cost))
 }

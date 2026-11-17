@@ -36,7 +36,7 @@ from litellm.proxy.auth.auth_checks import (
     get_key_object,
     get_team_object,
 )
-from litellm.proxy.auth.customer_spend import settle_customer_spend, settle_customer_spend_from_plan
+from litellm.proxy.auth.customer_spend import settle_customer_spend
 from litellm.proxy.auth.route_checks import RouteChecks
 from litellm.proxy.db.db_lookup_gate import DBLookupDeadlineExceeded
 from litellm.proxy.db.db_spend_update_writer import (
@@ -1255,6 +1255,17 @@ def _ledger_counter_options(ledger: object) -> _LedgerCounterOptions:
     return {"windows_from_ledger": True} if ledger is True else {}
 
 
+class _CustomerHierarchyOptions(TypedDict):
+    customer_hierarchy: ReadOnly[NotRequired[object]]
+
+
+def _customer_hierarchy_options(
+    ledger: _LedgerCounterOptions, metadata: Mapping[str, object]
+) -> _CustomerHierarchyOptions:
+    """With the ledger the Rust counter step settles the customer hierarchy itself, in the same step."""
+    return {"customer_hierarchy": metadata.get("user_api_key_customer_hierarchy")} if ledger else {}
+
+
 class _ChargeSpend(Protocol):
     async def __call__(
         self,
@@ -1318,6 +1329,7 @@ class _IncrementSpendCounters(Protocol):
         committed_spend_scope: EntitySpendCounterKeys | None = None,
         windows_from_ledger: bool = False,
         customer_counters: "Sequence[BudgetCounter]" = (),
+        customer_hierarchy: object = None,
     ) -> None: ...
 
 
@@ -1487,15 +1499,13 @@ async def _update_database_and_spend_counters_in_batch(
 
     from litellm.proxy.proxy_server import spend_counter_store
 
-    ledger_options: Final = _ledger_counter_options(
-        _BATCH_CALLBACK_FIELDS.validate_python(kwargs).get(ACCOUNTING_LEDGER_KWARG)
-    )
     try:
-        await (settle_customer_spend_from_plan if ledger_options.get("windows_from_ledger") else settle_customer_spend)(
-            _OBJECT_MAPPING.validate_python(get_litellm_metadata_from_kwargs(kwargs=kwargs)),
-            response_cost,
-            spend_counter_store,
+        ledger_options: Final = _ledger_counter_options(
+            _BATCH_CALLBACK_FIELDS.validate_python(kwargs).get(ACCOUNTING_LEDGER_KWARG)
         )
+        metadata: Final = _OBJECT_MAPPING.validate_python(get_litellm_metadata_from_kwargs(kwargs=kwargs))
+        if not ledger_options:
+            await settle_customer_spend(metadata, response_cost, spend_counter_store)
         await increment_spend_counters(
             token=user_api_key,
             team_id=team_id,
@@ -1523,6 +1533,7 @@ async def _update_database_and_spend_counters_in_batch(
             ),
             **ledger_options,
             **_customer_counter_options(customer_counters),
+            **_customer_hierarchy_options(ledger_options, metadata),
         )
     except Exception:
         if budget_reservation is not None:

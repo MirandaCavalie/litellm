@@ -41,11 +41,6 @@ mod _native {
         auth_route_matches_prefix, auth_route_matches_wildcard,
     };
     #[pymodule_export]
-    use crate::budget_counters::{
-        budget_window_counters, committed_spend_counter_keys, customer_spend_settlement,
-        spend_counter_keys, spend_counter_plan,
-    };
-    #[pymodule_export]
     use crate::budgets::NativeBudgets;
     #[pymodule_export]
     use crate::budgets::budget_check_decision;

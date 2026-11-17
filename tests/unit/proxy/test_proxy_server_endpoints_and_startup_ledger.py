@@ -7,14 +7,20 @@ from tests.unit.proxy.spend_counters_ledger_twin import force_ledger_windows, le
 
 _WINDOW_ROW_QUEUE_SCENARIOS: Final = frozenset({"test_a_slow_window_row_read_does_not_hold_back_the_key_spend_counter"})
 
+# Scenarios whose store is FakeSpendCounters, which the Rust counter step cannot run on. The Rust store tests in
+# test_rust_counter_step.py and the crate's tests/charge.rs cover them on the ledger path
+_FAKE_STORE_SCENARIOS: Final = frozenset({"test_increment_spend_counters_finalizes_after_unreserved_increments"})
+
 
 def _counter_scenario(name: str) -> bool:
-    return ("spend_counter" in name or "increment_spend" in name) and name not in _WINDOW_ROW_QUEUE_SCENARIOS
+    return (
+        "spend_counter" in name or "increment_spend" in name
+    ) and name not in _WINDOW_ROW_QUEUE_SCENARIOS | _FAKE_STORE_SCENARIOS
 
 
 globals().update(ledger_scenarios(scenarios, _counter_scenario))
 
 
 @pytest.fixture(autouse=True)
-def _ledger_windows(monkeypatch: pytest.MonkeyPatch) -> None:
+def ledger_windows(monkeypatch: pytest.MonkeyPatch) -> None:
     force_ledger_windows(monkeypatch)
